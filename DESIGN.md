@@ -506,27 +506,44 @@ flowchart TB
 {工作目录}/
 ├── input/
 │   └── sample.txt                     输入文件（使用方提供）
-├── parts/                              分片目录（运行中）
-│   ├── part-000001.success.part        批次1 成功记录分片
-│   ├── part-000001.error.part          批次1 失败记录分片（无失败则不存在）
-│   └── part-000011.success.part        …
+├── parts/                              分片目录（运行中，按通道分子目录）
+│   ├── paid/
+│   │   ├── part-000001.part            批次1 中落在 paid 通道的记录
+│   │   └── part-000011.part
+│   ├── shipped/
+│   │   └── part-000001.part
+│   └── error/
+│       └── part-000002.part            失败记录 + 未注册路由兜底
 └── output/
-    ├── sample.success                  主输出文件（仅成功记录）
-    └── sample.error                    错误文件（失败记录，含级别列）
+    ├── order.paid                      通道 paid 的最终文件
+    ├── order.shipped                   通道 shipped 的最终文件
+    └── order.error                     错误通道的最终文件
 ```
 
 命名约定：
 
 | 文件 | 规则 | 目的 |
 |---|---|---|
-| 分片 | `part-%06d.{success\|error}.part` | 零填充保证字典序 = 批次序号 |
+| 通道分片 | `{通道key}/part-%06d.part` | 零填充保证字典序 = 批次序号；按 key 分子目录，合并时扫一个目录即可 |
 | 临时输出 | `{目标文件名}.tmp` | 写完后 rename，保证原子可见 |
-| 不存在的分片 | 不创建（0 字节文件会被主动删除） | 避免合并阶段扫描空文件 |
+| 不存在的分片 | 不创建（只有真正有记录时才 openWriter） | "本批该通道无数据" 由此自然可判，无需额外计数 |
+
+**为什么按通道分子目录，而不是 `part-000001.paid.part`**：
+
+1. 合并时按目录扫描，不必解析文件名的通道部分；
+2. 通道 key 不必参与文件名转义（`.` `-` 等字符不会与后缀规则冲突）；
+3. 排查现场时能直接 `ls parts/paid` 定位。
+
+**通道 key 的字符约束**：`[A-Za-z0-9][A-Za-z0-9._-]{0,47}`。必须 ASCII——中文目录名在
+macOS/Linux 正常，但跨 Windows 打包、zip 解压、CI 缓存时经常乱码。业务文案放 formatter。
 
 **分片清理策略**：
 
-- 合并成功 → 删除整个 `parts/` 目录（受 `deletePartsOnSuccess` 控制）；
+- 合并成功 → 删除整个 `parts/` 目录（含各通道子目录，受 `deletePartsOnSuccess` 控制）；
 - 流水线中止 → **保留** `parts/`，作为现场用于排查或后续续跑。
+
+> 注意：`prepareDirectories()` 必须**递归**清理 `parts/`。多通道下里面是子目录，
+> 早期实现用 `f.delete()` 只能删空目录，会残留上次运行的分片并被合并进本次输出。
 
 ### 6.3 输出格式规格
 
@@ -768,7 +785,7 @@ public interface LineFormatter<T, P> {
 
 | 扩展点 | 方式 |
 |---|---|
-| 输出还需第三种文件（如告警文件） | 新增 renderer 槽位 + 对应 `LineFormatter` |
+| 输出还需第三种文件（如告警文件） | **已实现（v1.1）**：`channel("alarm", file, fmt)` 声明即可，见 §14 |
 | 需要批次结果明细留存 | 在 `BatchTask` 中增加 `ResultCollector` 回调 |
 | 需要进程级断点续跑 | 读取异常时 `parts/` 已保留，按最大批次序号跳过已处理批次即可实现 |
 | 需要 Prometheus 指标 | 从 `PipelineStats` 取值导出 |
@@ -866,5 +883,98 @@ A：直接追加需要锁（退化串行、顺序不可控），且在失败时�
 A：当前按需求未内置重试（错误处理以状态码记录为准）。如需重试，在 `BatchProcessor` 实现内部自行退避重试即可，不影响内核。
 
 **Q：输出文件的行序有保证吗？**
-A：有。分片按批次序号零填充命名，合并按升序进行，因此输出天然等于输入行序（即使各批次并行完成顺序是乱的）。
+A：有，但**在通道内部**。分片按批次序号零填充命名，合并按升序进行，因此每个通道的行序等于该通道记录在输入中的相对顺序（即使各批次并行完成顺序是乱的）。跨通道不保证全局顺序——这是"分到不同文件"的必然结果，不是缺陷。
+
+---
+
+## 14. 多输出通道（v1.1）
+
+### 14.1 动机
+
+v1.0 的分流是硬编码二选一，散落在五处：`PipelineConfig` 四个字段、`PartWriter` 两个后缀常量、
+`PartWriter.writeResults` 的 `if/else`、`BatchTask` 的 `int[]{ok,ng}`、`mergeOutputs` 的两次固定调用。
+
+真实场景是「按业务状态分文件」：批量查订单状态，已付款 / 已发货 / 已完成 / 已取消 各一个文件，
+查询失败与未识别状态进错误文件。这不是"多几个文件名"，而是**通道必须成为一等公民**。
+
+### 14.2 通道模型
+
+```java
+OutputChannel<T, P> = key + target(File) + formatter + createEmpty + isError
+```
+
+- 声明期（`build()`）确定全部通道，运行期只读；
+- `key` 是唯一凭据，用于分片子目录名与日志标签，约束 `[A-Za-z0-9][A-Za-z0-9._-]{0,47}`；
+- `formatter` 每通道独立——不同文件可以有不同的列结构，这是最常见的真实需求；
+- `createEmpty` 每通道独立——`error` 通道常设为 true 以便告警侧统一取文件，业务通道默认不生成。
+
+### 14.3 路由
+
+`RoutingProcessor<T,P>` 是 `BatchProcessor` 的**可选**扩展，不实现则行为与 v1.0 完全一致。
+
+解析顺序（`ChannelRouter.resolve`）：
+
+1. 处理器实现了 `RoutingProcessor` → 取其返回值；
+2. 返回 `null` → 按状态走默认（成功 → `success`，失败 → `error`）；
+3. 返回的 key 未在配置中声明 → 落错误通道，标记 fallback，累计计数，首次出现时告警。
+
+**为什么是白名单而不是"边跑边建"**：动态建通道看起来更灵活，但一个大小写错误或多一个空格
+（`"paid "`）就会静默产出一组没人读的文件，程序不报错，下游照常读旧文件，往往到对账日才发现
+数据分错了地方。白名单 + 兜底 + 计数把这类事故压缩成一条明确日志：
+
+```
+[WARN] 未注册的输出通道 "partial_shipped"（批次内下标 94，记录 ORD-000095|...），已兜底到 "error"
+[WARN] 存在未注册的输出通道：共 50 条记录被兜底到 "error"，分布 {partial_shipped=50}
+```
+
+### 14.4 两个必须处理的正确性问题
+
+**① 兜底记录的格式一致性**
+兜底记录往往"业务上是成功的"（如订单状态查到了，但那个状态没有对应通道）。若按成功格式
+写入错误文件，错误文件里就会混入列数不同的行，下游按列解析直接错位。
+
+处理：`PartWriter.format()` 对 fallback 记录合成一条 `UNROUTED:{requestedKey}` 的失败结果，
+强制走错误格式：
+
+```
+ORD-000095|CUST-00096|45.15	RECORD	UNROUTED:partial_shipped	通道 partial_shipped 未注册（原始结果码 PARTIAL）
+```
+
+**② 分片目录的递归清理**
+多通道下 `parts/` 里是子目录，`File.delete()` 只能删空目录。若不递归，上次运行的分片会残留
+并被合并进本次输出——这类 bug 极难发现（数据"变多了"，但不报错）。`prepareDirectories()` 现改为
+`OutputMerger.deleteChildren()` 递归清理，并检查 `delete()` 返回值。
+
+### 14.5 守恒关系
+
+每条记录恰好落一个通道，因此：
+
+```
+Σ(各通道行数) = 输入条数
+```
+
+批次级失败整批计入错误通道，不破坏该等式。Demo 实测 `1000 = 397 + 298 + 149 + 99 + 57`。
+
+**注意**：`PipelineStats` 的「失败记录合计」只统计 `FAILED` 与 BATCH 牵连记录，不含 fallback；
+fallback 有独立计数（`ChannelRouter.unregisteredTotal()`）。两者不要混看。
+
+### 14.6 与 v1.0 的兼容性
+
+| 老用法 | 行为 |
+|---|---|
+| `successFile` + `successFormatter` | build 时自动转为 `success` 通道 |
+| `errorFile` + `errorFormatter` | build 时自动转为 `error` 通道 |
+| 处理器只实现 `BatchProcessor` | 路由退化为"成功→success，失败→error"，与 v1.0 一致 |
+| `createEmptyOutput` | 作为老 API 两通道的 `createEmpty` 默认值 |
+
+老 Demo（`DemoMain` + `DemoHttpProcessor`）源码零改动，实测输出与 v1.0 逐行一致（`1050 = 997 + 53`）。
+
+### 14.7 明确不支持的两种形态
+
+| 形态 | 为什么不做 |
+|---|---|
+| **动态分区**（按机构/日期等字段拆出成千上万个文件） | 需要分区爆炸治理（文件句柄、小文件）、路径消毒（key 来自数据，含 `/`、`..` 即目录穿越）、延迟建目录、跨批次 key 集合合并规则。属于另一套设计，不是加个 `Map` 能覆盖的 |
+| **一对多产出**（100 条输入 → 120 条输出） | 会破坏 `BatchTask` 的 1:1 校验（这是"一条不丢"的唯一凭据），守恒式要换成"输入覆盖率 100%"，还要给每行加源记录序号才能追溯与重试。代价远超收益 |
+
+若确实需要，应作为独立设计评审，而不是在现有 SPI 上打补丁。
 

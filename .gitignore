@@ -12,3 +12,6 @@ out/
 
 # Demo 运行产物（demo-run/input 与 output 为示例证据，保留）
 !demo-run/
+
+# 多通道 Demo 产物
+order-demo/

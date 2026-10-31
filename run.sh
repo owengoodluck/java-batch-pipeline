@@ -4,7 +4,7 @@ set -e
 cd "$(dirname "$0")"
 
 OUT="out/classes"
-rm -rf "$OUT" demo-run
+rm -rf "$OUT" demo-run order-demo
 mkdir -p "$OUT"
 
 echo "==> 编译"
@@ -19,3 +19,11 @@ java -cp "$OUT" com.example.demo.DemoMain demo-run adapter
 
 echo
 echo "==> 产物：demo-run/output/sample.success 与 demo-run/output/sample.error"
+
+echo
+echo "==> 多通道示例：1000 条订单按查询到的状态分到 4 个业务文件 + 1 个错误文件"
+java -cp "$OUT" com.example.demo.DemoOrderMain order-demo 1000
+
+echo
+echo "==> 产物：order-demo/output/order.{paid,shipped,completed,cancelled,error}"
+echo "==> 分片：order-demo/parts/{通道名}/part-000001.part"

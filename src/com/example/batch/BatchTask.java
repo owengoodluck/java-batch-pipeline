@@ -2,6 +2,7 @@ package com.example.batch;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Semaphore;
 
 /**
@@ -73,21 +74,41 @@ public final class BatchTask<T, P> implements Runnable {
             return;
         }
 
-        int[] counted = partWriter.writeResults(batchSeq, batch, results);
+        Map<String, Integer> counted = partWriter.writeResults(batchSeq, batch, results);
         stats.addBatchOk();
         countResults(results);
-        PipelineLog.info("批次 #%d 完成: 成功 %d 条 / 记录级失败 %d 条", batchSeq, counted[0], counted[1]);
+        for (Map.Entry<String, Integer> e : counted.entrySet()) {
+            stats.addChannel(e.getKey(), e.getValue());
+        }
+        PipelineLog.info("批次 #%d 完成: %s", batchSeq, describeChannels(counted));
     }
 
     private void handleBatchFailed(String errorCode, String message) throws IOException {
         int n = partWriter.writeBatchFailed(batchSeq, batch, errorCode, message);
         stats.addBatchFailed();
+        stats.addChannel(config.getErrorChannelKey(), n);
         for (int i = 0; i < n; i++) {
             stats.addRecordBatchFailed();
         }
         stats.addCode(errorCode);
-        PipelineLog.warn("批次 #%d 整批失败: code=%s msg=%s（%d 条已写入错误文件）",
-                batchSeq, errorCode, message, n);
+        PipelineLog.warn("批次 #%d 整批失败: code=%s msg=%s（%d 条已写入错误通道 %s）",
+                batchSeq, errorCode, message, n, config.getErrorChannelKey());
+    }
+
+    /** 按通道声明顺序拼一段稳定的描述，避免日志随线程调度抖动。 */
+    private String describeChannels(Map<String, Integer> counted) {
+        StringBuilder sb = new StringBuilder();
+        for (String key : config.getChannels().keySet()) {
+            Integer n = counted.get(key);
+            if (n == null || n.intValue() == 0) {
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append(" / ");
+            }
+            sb.append(key).append(' ').append(n).append(" 条");
+        }
+        return sb.length() == 0 ? "无写入" : sb.toString();
     }
 
     private void countResults(List<ItemResult<P>> results) {

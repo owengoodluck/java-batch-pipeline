@@ -19,6 +19,9 @@ public final class PipelineStats {
     private final AtomicLong recordBatchFailed = new AtomicLong();
     private final ConcurrentHashMap<String, AtomicLong> errorCodeCounts =
             new ConcurrentHashMap<String, AtomicLong>();
+    /** 各输出通道累计写入行数：用于回答"某个通道这次有没有数据"。 */
+    private final ConcurrentHashMap<String, AtomicLong> channelCounts =
+            new ConcurrentHashMap<String, AtomicLong>();
 
     private volatile long startTimeNanos;
     private volatile long endTimeNanos;
@@ -59,9 +62,33 @@ public final class PipelineStats {
         recordBatchFailed.incrementAndGet();
     }
 
+    /** 累加某个输出通道本次写入的行数。 */
+    public void addChannel(String key, int n) {
+        if (key == null || n <= 0) {
+            return;
+        }
+        AtomicLong counter = channelCounts.get(key);
+        if (counter == null) {
+            counter = new AtomicLong();
+            AtomicLong prev = channelCounts.putIfAbsent(key, counter);
+            if (prev != null) {
+                counter = prev;
+            }
+        }
+        counter.addAndGet(n);
+    }
+
+    /** 通道写入行数快照（key → 行数）。 */
+    public Map<String, Long> getChannelCounts() {
+        Map<String, Long> snapshot = new java.util.LinkedHashMap<String, Long>();
+        for (Map.Entry<String, AtomicLong> e : channelCounts.entrySet()) {
+            snapshot.put(e.getKey(), e.getValue().get());
+        }
+        return snapshot;
+    }
+
     /** 记录错误码出现次数（成功码也记录，便于完整核对）。 */
-    public void addCode(String code) {
-        if (code == null) {
+    public void addCode(String code) {        if (code == null) {
             code = "-";
         }
         AtomicLong counter = errorCodeCounts.get(code);
@@ -124,6 +151,17 @@ public final class PipelineStats {
         PipelineLog.info("总耗时            : %d ms", elapsed);
         if (batchSubmitted.get() > 0) {
             PipelineLog.info("平均每批耗时      : %d ms", elapsed / batchSubmitted.get());
+        }
+        PipelineLog.info("----- 通道分布（写入行数） -----");
+        List<Map.Entry<String, AtomicLong>> channelEntries =
+                new ArrayList<Map.Entry<String, AtomicLong>>(channelCounts.entrySet());
+        Collections.sort(channelEntries, new java.util.Comparator<Map.Entry<String, AtomicLong>>() {
+            public int compare(Map.Entry<String, AtomicLong> a, Map.Entry<String, AtomicLong> b) {
+                return Long.compare(b.getValue().get(), a.getValue().get());
+            }
+        });
+        for (Map.Entry<String, AtomicLong> e : channelEntries) {
+            PipelineLog.info("%-16s %d", e.getKey(), e.getValue().get());
         }
         PipelineLog.info("----- 状态码分布 -----");
         List<Map.Entry<String, AtomicLong>> entries =

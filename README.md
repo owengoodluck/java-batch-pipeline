@@ -43,12 +43,15 @@ src/com/example/batch/            ← 与业务无关的通用内核（不要改
 ├── RecordReader.java           读取接口（SPI）
 ├── RecordReaders.java          Iterator / read() 形态的适配器
 ├── BatchProcessor.java         批处理接口（SPI，通常是调 HTTP）
+├── RoutingProcessor.java       按结果分流到不同通道（SPI 的可选扩展）
 ├── BatchFailedException.java   批次级失败异常（携带错误码）
 ├── ItemResult.java / OutcomeStatus.java   单条结果模型
 ├── LineFormatter.java          输出行格式化接口（SPI）
-├── PipelineConfig.java         配置 + Builder（参数校验）
-├── PipelineStats.java          统计（行数/批次/状态码分布/耗时）
-├── PartWriter.java             分片写入（成功/错误分流）
+├── OutputChannel.java          输出通道 = 一个目标文件 + 一套行格式
+├── ChannelRouter.java          通道路由 + 未注册通道兜底
+├── PipelineConfig.java         配置 + Builder（通道表 + 参数校验）
+├── PipelineStats.java          统计（行数/批次/通道/状态码/耗时）
+├── PartWriter.java             分片写入（按通道路由到各自目录）
 ├── OutputMerger.java           分片合并 + 原子 rename
 ├── BatchTask.java              单批任务（异常降级 + 名额归还）
 ├── FileBatchPipeline.java      内核编排（生产者/背压/合并/停机）
@@ -58,7 +61,10 @@ src/com/example/demo/            ← 业务方要写的部分（替换成你的�
 ├── DemoLineReader.java         RecordReader 的一种实现（文本文件按行读）
 ├── DemoHttpProcessor.java      BatchProcessor 的一种实现（模拟批量 HTTP）
 ├── DemoLineFormatter.java      LineFormatter 的实现（平铺格式）
-└── DemoMain.java               装配 + 运行
+├── DemoMain.java               装配 + 运行（双输出：成功 / 错误）
+├── DemoOrderStatus.java        订单状态枚举（其中一个状态故意不注册通道）
+├── DemoOrderProcessor.java     RoutingProcessor 实现：按查询到的状态分流
+└── DemoOrderMain.java          装配 + 运行（多通道：4 个业务文件 + 1 个错误文件）
 ```
 
 ---
@@ -91,9 +97,57 @@ src/com/example/demo/            ← 业务方要写的部分（替换成你的�
 
 ### 3. 合并：分片 + 后置合并 + 原子落地
 
-并行阶段每个批次只写自己的分片文件（`part-000007.success.part`），零锁竞争；全部结束后单线程按批次序号升序流式合并，先写 `*.tmp` 再 `rename`，下游**永远读不到写了一半的文件**。
+并行阶段每个批次只写自己的分片文件（`parts/paid/part-000007.part`），零锁竞争；全部结束后单线程按批次序号升序流式合并，先写 `*.tmp` 再 `rename`，下游**永远读不到写了一半的文件**。
 
-因为批次序号是连续分配的、且文件名零填充，所以**合并结果天然保持原始行序**（虽然本需求不要求，但排查时很省事）。
+因为批次序号是连续分配的、且文件名零填充，所以**每个通道内部天然保持原始行序**（虽然本需求不要求，但排查时很省事）。
+
+### 4. 多通道：按业务状态分流到不同文件
+
+默认两个输出（成功 / 错误）足够时不用管这一节。当"不同结果要写不同文件"时——比如批量查订单状态，按 **已付款 / 已发货 / 已完成 / 已取消** 各出一个文件——用通道表：
+
+```java
+PipelineConfig.<String, String>builder()
+    .reader(...).processor(new MyOrderProcessor())
+    .partsDir(new File(dir, "parts"))
+    .channel("paid",      new File(dir, "order.paid"),      fmt)
+    .channel("shipped",   new File(dir, "order.shipped"),   fmt)
+    .channel("completed", new File(dir, "order.completed"), fmt)
+    .channel("cancelled", new File(dir, "order.cancelled"), fmt)
+    .channel(OutputChannel.<String, String>error(new File(dir, "order.error"), fmt))
+    .build();
+```
+
+处理器额外实现 `RoutingProcessor`，为每条记录给出通道 key：
+
+```java
+public String channelOf(int indexInBatch, String record, ItemResult<String> result) {
+    if (!result.isSuccess()) return null;          // null = 走默认（失败 → error）
+    return statusChannel(result.getCode());         // 例：PAID → "paid"
+}
+```
+
+**三条硬规则**：
+
+| 规则 | 原因 |
+|---|---|
+| 通道必须在 `build()` 时全部声明，运行期只允许路由到已声明的 key | 避免拼写错误/多余空格静默产出没人读的文件；未注册的 key 一律兜底到 `error` 并计数告警 |
+| 兜底记录强制走错误格式（`UNROUTED:xxx`） | 否则错误文件里会混入列数不同的行，下游按列解析直接错位 |
+| 通道 key 用 ASCII（`paid`），不要用中文状态名 | key 会作为分片子目录名，中文目录名跨 Windows 打包 / zip 解压容易乱码 |
+
+**守恒关系**：每条记录恰好落一个通道，因此 `Σ各通道行数 = 输入条数`（批次级失败也整批计入错误通道，一条不丢）。
+
+**分片布局**：
+
+```
+parts/
+├── paid/part-000001.part
+├── shipped/part-000001.part
+└── error/part-000002.part      ← 未注册通道与查询失败都落这里
+```
+
+按通道分子目录，而不是 `part-000001.paid.part`：合并时扫一个目录就够，通道 key 也不必参与文件名转义。
+
+**某个通道这次没有记录**：不会有分片文件，合并阶段自然就知道——不需要额外统计。若下游必须拿到固定文件，用 `channel.createEmpty(true)` 单独打开（`error` 通道建议打开，便于告警侧统一处理）。
 
 ---
 

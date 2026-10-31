@@ -16,33 +16,37 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * 合并器：把分片目录里的 *.{ext}.part 按批次序号升序，流式追加成一个最终文件。
+ * 合并器：把一个通道分片目录下的 {@code *.part} 按批次序号升序，流式追加成一个最终文件。
  *
  * <p>先写临时文件再 rename，保证下游永远不会读到写了一半的输出文件。
+ *
+ * <p>多通道下每个通道独立合并，互不影响；某个通道合并失败不会破坏其他通道已生成的文件。
  */
 public final class OutputMerger {
+
+    private static final String PART_SUFFIX = ".part";
 
     private OutputMerger() {
     }
 
     /**
-     * @param partsDir 分片目录
-     * @param target   最终输出文件
-     * @param ext      PartWriter.SUCCESS_EXT 或 PartWriter.ERROR_EXT
+     * @param channelPartsDir 单个通道的分片目录（{@code parts/{key}}），不存在视为无数据
+     * @param target          该通道的最终输出文件
+     * @param createEmptyOutput 无分片时是否仍生成空文件
      * @return 合并出的行数
      */
-    public static long merge(File partsDir, File target, String ext, Charset charset,
+    public static long merge(File channelPartsDir, File target, Charset charset,
                              boolean createEmptyOutput) throws IOException {
-        List<File> parts = listParts(partsDir, ext);
-        long lines = 0;
+        List<File> parts = listParts(channelPartsDir);
         if (parts.isEmpty() && !createEmptyOutput) {
-            return 0;
+            return 0L;
         }
         ensureParentDir(target);
         File tmp = new File(target.getParentFile(), target.getName() + ".tmp");
 
         BufferedWriter writer = new BufferedWriter(
                 new OutputStreamWriter(new FileOutputStream(tmp, false), charset));
+        long lines = 0L;
         try {
             for (File part : parts) {
                 BufferedReader reader = new BufferedReader(
@@ -65,14 +69,16 @@ public final class OutputMerger {
         return lines;
     }
 
-    /** 分片文件名带零填充序号，字典序即批次顺序，因此天然保持文件行序。 */
-    private static List<File> listParts(File partsDir, String ext) {
-        String suffix = "." + ext + ".part";
-        File[] files = partsDir.listFiles();
+    /** 分片文件名带零填充序号，字典序即批次顺序，因此通道内部天然保持输入行序。 */
+    private static List<File> listParts(File channelPartsDir) {
         List<File> result = new ArrayList<File>();
+        if (channelPartsDir == null || !channelPartsDir.isDirectory()) {
+            return result;
+        }
+        File[] files = channelPartsDir.listFiles();
         if (files != null) {
             for (File f : files) {
-                if (f.isFile() && f.getName().endsWith(suffix)) {
+                if (f.isFile() && f.getName().endsWith(PART_SUFFIX)) {
                     result.add(f);
                 }
             }
@@ -98,17 +104,27 @@ public final class OutputMerger {
         }
     }
 
-    /** 清理分片目录（仅在合并成功后调用）。 */
+    /** 清理分片目录（仅在全部通道合并成功后调用）。多通道下需要递归删除各通道路径。 */
     public static void cleanup(File partsDir) throws IOException {
-        if (!partsDir.exists()) {
+        if (partsDir == null || !partsDir.exists()) {
             return;
         }
-        File[] files = partsDir.listFiles();
-        if (files != null) {
-            for (File f : files) {
-                f.delete();
+        deleteChildren(partsDir);
+        partsDir.delete();
+    }
+
+    static void deleteChildren(File dir) {
+        File[] files = dir.listFiles();
+        if (files == null) {
+            return;
+        }
+        for (File f : files) {
+            if (f.isDirectory()) {
+                deleteChildren(f);
+            }
+            if (!f.delete()) {
+                PipelineLog.warn("清理分片失败（可能被占用）: %s", f.getAbsolutePath());
             }
         }
-        partsDir.delete();
     }
 }

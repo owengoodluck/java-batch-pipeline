@@ -37,6 +37,7 @@ public final class FileBatchPipeline<T, P> {
     private Semaphore semaphore;
     private ExecutorService pool;
     private PartWriter<T, P> partWriter;
+    private ChannelRouter<T, P> router;
     private Thread shutdownHook;
 
     public FileBatchPipeline(PipelineConfig<T, P> config) {
@@ -74,10 +75,11 @@ public final class FileBatchPipeline<T, P> {
             prepareDirectories();
             semaphore = new Semaphore(config.maxInflightBatches());
             pool = createPool();
-            partWriter = new PartWriter<T, P>(config.getPartsDir(), config.getCharset(), config);
-            PipelineLog.info("启动流水线: batchSize=%d consumers=%d buffer=%d maxInflight=%d",
+            router = new ChannelRouter<T, P>(config);
+            partWriter = new PartWriter<T, P>(config.getPartsDir(), config.getCharset(), config, router);
+            PipelineLog.info("启动流水线: batchSize=%d consumers=%d buffer=%d maxInflight=%d channels=%s",
                     config.getBatchSize(), config.getConsumerThreads(), config.getBufferBatches(),
-                    config.maxInflightBatches());
+                    config.maxInflightBatches(), config.getChannels().keySet());
 
             Thread producer = new Thread(new Runnable() {
                 public void run() {
@@ -107,6 +109,7 @@ public final class FileBatchPipeline<T, P> {
             abort(t);
         } finally {
             releaseResources();
+            reportUnregisteredChannels();
             stats.printSummary();
         }
 
@@ -194,12 +197,23 @@ public final class FileBatchPipeline<T, P> {
     }
 
     private void mergeOutputs() throws IOException {
-        long okLines = OutputMerger.merge(config.getPartsDir(), config.getSuccessFile(),
-                PartWriter.SUCCESS_EXT, config.getCharset(), config.isCreateEmptyOutput());
-        long errLines = OutputMerger.merge(config.getPartsDir(), config.getErrorFile(),
-                PartWriter.ERROR_EXT, config.getCharset(), config.isCreateEmptyOutput());
-        PipelineLog.info("输出文件已生成: %s (%d 行)", config.getSuccessFile().getName(), okLines);
-        PipelineLog.info("错误文件已生成: %s (%d 行)", config.getErrorFile().getName(), errLines);
+        for (OutputChannel<T, P> channel : config.getChannels().values()) {
+            File channelDir = channel.partsDirOf(config.getPartsDir());
+            long lines = OutputMerger.merge(channelDir, channel.getTarget(),
+                    config.getCharset(), channel.isCreateEmpty());
+            PipelineLog.info("通道 %-12s → %-24s %d 行", channel.getKey(),
+                    channel.getTarget().getName(), lines);
+        }
+    }
+
+    /** 未注册通道是数据被错误分流的唯一信号，必须在收尾时显式告警，不能只留在日志中间。 */
+    private void reportUnregisteredChannels() {
+        if (router == null || router.unregisteredTotal() == 0L) {
+            return;
+        }
+        PipelineLog.warn("存在未注册的输出通道：共 %d 条记录被兜底到 \"%s\"，分布 %s",
+                router.unregisteredTotal(), config.getErrorChannelKey(),
+                router.unregisteredSnapshot());
     }
 
     private void releaseResources() {
@@ -241,17 +255,12 @@ public final class FileBatchPipeline<T, P> {
     private void prepareDirectories() throws IOException {
         File partsDir = config.getPartsDir();
         if (partsDir.exists()) {
-            File[] old = partsDir.listFiles();
-            if (old != null) {
-                for (File f : old) {
-                    f.delete();   // 清理上次运行残留，避免合并到旧分片
-                }
-            }
+            // 多通道下 partsDir 里是各通道的子目录，必须递归清理，否则残留分片会被合并进本次输出
+            OutputMerger.deleteChildren(partsDir);
         }
         mkdirs(partsDir);
-        mkdirs(config.getSuccessFile().getParentFile());
-        if (config.getErrorFile().getParentFile() != null) {
-            mkdirs(config.getErrorFile().getParentFile());
+        for (OutputChannel<T, P> channel : config.getChannels().values()) {
+            mkdirs(channel.getTarget().getParentFile());
         }
     }
 
