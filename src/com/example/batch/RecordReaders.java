@@ -1,5 +1,6 @@
 package com.example.batch;
 
+import java.io.IOException;
 import java.util.Iterator;
 import java.util.NoSuchElementException;
 
@@ -11,9 +12,9 @@ public final class RecordReaders {
     private RecordReaders() {
     }
 
-    /** 允许抛受检异常的取值函数。 */
+    /** 允许抛 IO 异常的取值函数。 */
     public interface ExSupplier<T> {
-        T get() throws Exception;
+        T get() throws IOException;
     }
 
     /** 把 Iterator 适配为 RecordReader。 */
@@ -63,12 +64,12 @@ public final class RecordReaders {
             this.readFunc = readFunc;
         }
 
-        public boolean hasNext() throws Exception {
+        public boolean hasNext() throws IOException {
             ensurePending();
             return hasPending;
         }
 
-        public T next() throws Exception {
+        public T next() throws IOException {
             ensurePending();
             if (!hasPending) {
                 throw new NoSuchElementException("reader already exhausted");
@@ -80,7 +81,7 @@ public final class RecordReaders {
         }
 
         /** 预读一条缓存起来，用于支撑 hasNext()。 */
-        private void ensurePending() throws Exception {
+        private void ensurePending() throws IOException {
             if (hasPending || exhausted) {
                 return;
             }

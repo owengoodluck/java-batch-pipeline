@@ -6,8 +6,6 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.io.Writer;
-import java.nio.charset.Charset;
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -29,20 +27,18 @@ import java.util.Map;
  *
  * <p>并行阶段每个批次只写自己的分片文件，同一通道的不同批次写的是不同文件，
  * 因此仍然完全无锁；最后统一由 {@link OutputMerger} 按批次序号合并。
+ *
+ * <p>所有通道共用同一个 {@link RecordFormatter}：普通通道只收到成功记录，错误通道只收到失败记录，
+ * 由路由保证一个 formatter 实例实际看到哪种结果；兜底记录会先合成失败结果再渲染。
  */
 public final class PartWriter<T, P> {
 
     private static final String PART_SUFFIX = ".part";
 
-    private final File partsDir;
-    private final Charset charset;
     private final PipelineConfig<T, P> config;
     private final ChannelRouter<T, P> router;
 
-    public PartWriter(File partsDir, Charset charset, PipelineConfig<T, P> config,
-                      ChannelRouter<T, P> router) {
-        this.partsDir = partsDir;
-        this.charset = charset;
+    PartWriter(PipelineConfig<T, P> config, ChannelRouter<T, P> router) {
         this.config = config;
         this.router = router;
     }
@@ -53,7 +49,7 @@ public final class PartWriter<T, P> {
      * <p>只有真正有记录的通道才会被打开并落盘，因此「本批该通道为空」不会留下 0 字节分片，
      * 合并阶段自然就知道哪些通道本次无数据。
      *
-     * @return 各通道本批写入的行数（按通道声明顺序），没有记录的通道不会出现在结果里
+     * @return 各通道本批写入的行数，没有记录的通道不会出现在结果里
      */
     public Map<String, Integer> writeResults(long batchSeq, List<T> batch,
                                              List<ItemResult<P>> results) throws IOException {
@@ -76,7 +72,7 @@ public final class PartWriter<T, P> {
                     writer = openWriter(partFile(key, batchSeq));
                     writers.put(key, writer);
                 }
-                writeLine(writer, format(channel, record, result, route));
+                writeLine(writer, formatLine(channel, record, result, route));
 
                 Integer prev = counts.get(key);
                 counts.put(key, prev == null ? 1 : prev + 1);
@@ -89,18 +85,20 @@ public final class PartWriter<T, P> {
         return counts;
     }
 
-    /** 整批调用失败：全部记录写入错误通道的分片（级别 BATCH）。 */
+    /** 整批调用失败：全部记录以失败结果写入错误通道的分片（统一走 format）。 */
     public int writeBatchFailed(long batchSeq, List<T> batch, String errorCode, String message)
             throws IOException {
-        String key = config.getErrorChannelKey();
-        OutputChannel<T, P> channel = config.getChannel(key);
-        File part = partFile(key, batchSeq);
+        OutputChannel<T, P> errorChannel = config.getChannel(config.getErrorChannelKey());
+        if (errorChannel == null) {
+            throw new IOException("通道路由失败：未声明错误通道（key=" + config.getErrorChannelKey() + "）");
+        }
+        File part = partFile(errorChannel.getKey(), batchSeq);
         BufferedWriter writer = openWriter(part);
         int n = 0;
         try {
             for (T record : batch) {
-                writeLine(writer, channel.getFormatter()
-                        .formatBatchFailed(record, errorCode, message));
+                writeLine(writer, errorChannel.getFormatter()
+                        .format(record, ItemResult.<P>failed(errorCode, message)));
                 n++;
             }
         } finally {
@@ -115,22 +113,20 @@ public final class PartWriter<T, P> {
      * <p>兜底记录（请求了未注册通道）即便业务上是成功的，也必须走**错误格式**：
      * 否则错误文件里会混入列数不同的行，下游按列解析直接错位。
      */
-    private String format(OutputChannel<T, P> channel, T record, ItemResult<P> result,
-                          ChannelRouter.Route route) {
-        if (route.isFallback()) {
-            ItemResult<P> synthetic = ItemResult.failed(
-                    "UNROUTED:" + route.getRequestedKey(),
-                    "通道 " + route.getRequestedKey() + " 未注册（原始结果码 " + result.getCode() + "）");
-            return channel.getFormatter().formatRecordFailed(record, synthetic);
-        }
-        if (result.isSuccess()) {
-            return channel.getFormatter().formatSuccess(record, result);
-        }
-        return channel.getFormatter().formatRecordFailed(record, result);
+    private String formatLine(OutputChannel<T, P> channel, T record, ItemResult<P> result,
+                              ChannelRouter.Route route) throws IOException {
+        // 兜底记录（请求了未注册通道）即便业务上是成功的，也必须渲染成失败结果：
+        // 否则错误文件里会混入列数不同的行，下游按列解析直接错位。
+        ItemResult<P> effective = route.isFallback()
+                ? ItemResult.<P>failed("UNROUTED:" + route.getRequestedKey(),
+                        "通道 " + route.getRequestedKey() + " 未注册（原始结果码 "
+                                + result.getCode() + "）")
+                : result;
+        return channel.getFormatter().format(record, effective);
     }
 
     private File partFile(String channelKey, long batchSeq) throws IOException {
-        File dir = new File(partsDir, channelKey);
+        File dir = new File(config.getPartsDir(), channelKey);
         if (!dir.isDirectory()) {
             // 多个消费者线程可能同时首次进入同一个通道，mkdirs 失败但目录已存在属于正常竞争
             if (!dir.mkdirs() && !dir.isDirectory()) {
@@ -145,7 +141,8 @@ public final class PartWriter<T, P> {
     }
 
     private BufferedWriter openWriter(File file) throws IOException {
-        return new BufferedWriter(new OutputStreamWriter(new FileOutputStream(file, false), charset));
+        return new BufferedWriter(new OutputStreamWriter(
+                new FileOutputStream(file, false), config.getCharset()));
     }
 
     private void writeLine(Writer writer, String line) throws IOException {
@@ -161,19 +158,5 @@ public final class PartWriter<T, P> {
                 // 关闭失败不影响主流程：数据已 flush 到内核缓冲
             }
         }
-    }
-
-    /** 列出所有通道的分片根目录（用于清理与排查）。 */
-    static List<File> allChannelDirs(File rootPartsDir) {
-        List<File> dirs = new ArrayList<File>();
-        File[] children = rootPartsDir.listFiles();
-        if (children != null) {
-            for (File f : children) {
-                if (f.isDirectory()) {
-                    dirs.add(f);
-                }
-            }
-        }
-        return dirs;
     }
 }

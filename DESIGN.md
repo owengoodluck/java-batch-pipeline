@@ -34,7 +34,7 @@
 | 批次级传输 | 传输单元是"批次"（默认 100 条），而非单条记录 |
 | 严格背压 | 信号量控制在途批次数，消费者忙且缓冲占满时生产者停止读取 |
 | 可配并发 | `consumerThreads`(N) + `bufferBatches`(B)，在途上限 = N + B |
-| 失败可区分 | 记录级失败（RECORD）与批次级失败（BATCH）分流记录，带级别列 |
+| 失败可区分 | 记录级失败与批次级失败均落错误通道，由错误码（如 `BATCH_*` 前缀）区分，无独立级别列 |
 | 数据不丢 | 任何路径下「输入行数 = 输出成功行数 + 错误行数」 |
 | 原子落地 | 先写 `*.tmp` 再 rename，下游不会读到半截文件 |
 | 优雅停止 | 异常/中断时停在安全边界：在途批次跑完、不覆盖旧产出、保留分片现场 |
@@ -43,7 +43,7 @@
 ### 1.3 非目标（Out of Scope）
 
 - **不实现具体的 HTTP 调用**：由使用方在 `BatchProcessor` 中实现；
-- **不实现具体的数据解析/输出格式**：由使用方的 `RecordReader` / `LineFormatter` 决定；
+- **不实现具体的数据解析/输出格式**：由使用方的 `RecordReader` / `RecordFormatter` 决定；
 - **不内置进程级断点续跑**：停止时保留 `parts/` 分片以支持外部实现，当前版本未内置自动续跑；
 - **不做分布式**：单机多线程模型，不涉及跨节点协调。
 
@@ -64,10 +64,10 @@
 | FR-7 | 读取源可替换（通用接口） | `RecordReader` SPI + `RecordReaders` 适配器 | 已实现 |
 | FR-8 | 调用 HTTP 接口做批处理 | `BatchProcessor` SPI | 已实现（Demo 为模拟） |
 | FR-9 | 记录每条记录的处理结果状态码 | `ItemResult`（status/code/payload/message） | 已实现 |
-| FR-10 | 批次失败/记录失败均落盘，且用不同级别区分 | 错误文件 `RECORD`/`BATCH` 级别列 | 已实现 |
+| FR-10 | 批次失败/记录失败均落盘，由错误码区分（批次失败用 `BATCH_*` 前缀） | 错误文件统一 `错误码 \t 错误信息 \t 原始记录` | 已实现 |
 | FR-11 | 成功与失败分流到两个独立输出文件 | `PartWriter` 双分片 + `OutputMerger` 双合并 | 已实现 |
 | FR-12 | 所有批次结果最终合并成统一输出文件 | `OutputMerger`（按序号升序流式合并） | 已实现 |
-| FR-13 | 输出格式按文件类型可替换 | `LineFormatter` SPI | 已实现 |
+| FR-13 | 输出格式按文件类型可替换 | `RecordFormatter` SPI（成功/错误通道共用） | 已实现 |
 | FR-14 | 失败后继续处理后续批次（不 fail-fast） | `BatchTask.handleBatchFailed()` | 已实现 |
 | FR-15 | 读取异常时终止整个流程 | `abort()` + 生产者 catch Throwable | 已实现 |
 | FR-16 | 结束时输出统计汇总 | `PipelineStats.printSummary()` | 已实现 |
@@ -101,8 +101,8 @@
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  接入层 / 业务实现层（使用方提供，随文件类型变化）              │
-│  RecordReader          BatchProcessor        LineFormatter    │
-│  (读取实现)             (HTTP调用实现)         (输出格式实现)   │
+│  RecordReader     BatchProcessor     RecordFormatter（成功/错误通道共用） │
+│  (读取实现)        (HTTP调用实现)       (输出格式实现)                   │
 └───────────────┬──────────────┬─────────────────┬─────────────┘
                 │              │                 │
 ┌───────────────▼──────────────▼─────────────────▼─────────────┐
@@ -143,7 +143,7 @@ flowchart TB
         direction LR
         RD["DemoLineReader<br/>RecordReader&lt;T&gt;"]
         PR["DemoHttpProcessor<br/>BatchProcessor&lt;T,P&gt;"]
-        FM["DemoLineFormatter<br/>LineFormatter&lt;T,P&gt;"]
+        FM["DemoLineFormatter<br/>RecordFormatter&lt;T,P&gt;"]
     end
 
     subgraph CORE["内核层 - 通用不变"]
@@ -160,9 +160,9 @@ flowchart TB
     end
 
     subgraph FS["存储"]
-        PART["parts/<br/>part-000007.success.part<br/>part-000007.error.part"]
-        SUC["output/sample.success<br/>主输出：成功记录"]
-        ERR["output/sample.error<br/>错误记录：含级别列"]
+        PART["parts/<br/>paid/part-000007.part<br/>error/part-000007.part"]
+        SUC["output/… 各通道目标文件<br/>（如 sample.success / order.paid）"]
+        ERR["output/sample.error<br/>错误记录：错误码/信息/原始记录"]
     end
 
     RD --> PROD
@@ -203,14 +203,13 @@ classDiagram
         <<interface>>
         +process(List~T~ batch, long batchSeq) List~ItemResult~P~~
     }
-    class LineFormatter~T_P~ {
+    class RecordFormatter~T_P~ {
         <<interface>>
-        +formatSuccess(T, ItemResult~P~) String
-        +formatRecordFailed(T, ItemResult~P~) String
-        +formatBatchFailed(T, String, String) String
+        +format(T, ItemResult~P~) String
     }
+    %% 错误通道与普通通道共用 RecordFormatter，无独立接口
     class ItemResult~P~ {
-        -OutcomeStatus status
+        -boolean success
         -String code
         -P payload
         -String message
@@ -274,7 +273,7 @@ classDiagram
     FileBatchPipeline ..> RecordReader : 依赖(注入)
     BatchTask --> BatchProcessor : 调用(注入)
     BatchTask --> PartWriter : 写分片
-    BatchTask ..> LineFormatter : 通过PartWriter使用
+    BatchTask ..> RecordFormatter : 通过PartWriter使用（成功/错误通道共用）
     BatchTask ..> BatchFailedException : 捕获/抛出
     BatchProcessor ..> ItemResult : 返回
     RecordReaders ..> RecordReader : 适配产出
@@ -547,7 +546,7 @@ macOS/Linux 正常，但跨 Windows 打包、zip 解压、CI 缓存时经常乱�
 
 ### 6.3 输出格式规格
 
-模板不固化任何格式，格式由 `LineFormatter` 决定。Demo 提供的默认实现为**制表符平铺**：
+模板不固化任何格式，格式由统一的 `RecordFormatter` 决定：成功通道读 `result.getPayload()`、错误通道读 `result.getCode()`/`getMessage()`。Demo 提供的默认实现为**制表符平铺**：
 
 **主输出文件（sample.success）**
 
@@ -684,27 +683,29 @@ public interface BatchProcessor<T, P> {
 | 整批失败 | 抛 `BatchFailedException`，携带 errorCode |
 | 线程安全 | 实现需支持被 N 个线程并发调用（无共享可变状态或使用同步） |
 
-### 8.3 LineFormatter<T, P>
+### 8.3 RecordFormatter<T, P>
+
+所有通道（成功 / 错误 / 任意业务通道）共用同一个行格式接口，由路由保证一个 formatter 实例只会收到一种结果：
 
 ```java
-public interface LineFormatter<T, P> {
-    String formatSuccess(T record, ItemResult<P> result);
-    String formatRecordFailed(T record, ItemResult<P> result);
-    String formatBatchFailed(T record, String errorCode, String message);
+/** 成功/失败记录 → 输出文件的一行；成功读 getPayload()，失败读 getCode()/getMessage() */
+public interface RecordFormatter<T, P> {
+    String format(T record, ItemResult<P> result);
 }
 ```
 
 | 约定 | 说明 |
 |---|---|
 | 返回值 | 单行文本，**不应包含换行符**（内核统一追加 `\n`） |
-| 主输出 / 错误文件 | 可注入同一个实现，也可分别注入不同实现 |
-| 级别列 | 建议在 `formatRecordFailed` 输出 `RECORD`、在 `formatBatchFailed` 输出 `BATCH` |
+| 成功通道 | 只收到成功结果，`result.isSuccess()` 为 true，读 `result.getPayload()` |
+| 错误通道（key="error"） | 只收到失败结果，读 `result.getCode()` / `result.getMessage()`；批次失败与记录失败的区别体现在错误码（如 `BATCH_*` 前缀） |
+| 为什么只有一个接口 | 早期版本拆成 `RecordFormatter` + `ErrorFormatter` 两个接口，但二者本质都是「记录 + 结果 → 一行」，合并后概念更少、API 更统一，且单方法天然支持 lambda |
 
 ### 8.4 ItemResult<P>
 
 | 字段 | 含义 |
 |---|---|
-| `status` | SUCCESS / FAILED |
+| `success` | 布尔位：true = 成功，false = 失败（不设枚举，只有两种状态） |
 | `code` | 状态码（由使用方定义，内核仅用于分布统计） |
 | `payload` | 附加内容（泛型 P，来自服务端响应） |
 | `message` | 失败信息 |
@@ -777,7 +778,7 @@ public interface LineFormatter<T, P> {
 
 1. 实现 `RecordReader<YourRecord>`（或用适配器包装现有读取工具）；
 2. 实现 `BatchProcessor<YourRecord, YourPayload>`（换成真实的批量 HTTP 调用）；
-3. 实现 `LineFormatter<YourRecord, YourPayload>`（定义该类型的行格式）。
+3. 提供一个 `RecordFormatter<YourRecord, YourPayload>`（lambda 即可）：成功通道读 `getPayload()`，错误通道读 `getCode()`/`getMessage()`，同一个接口覆盖两种结果。
 
 ### 11.2 已预留的扩展点
 
@@ -850,12 +851,13 @@ public interface LineFormatter<T, P> {
 | `BatchTask.java` | 5.3 消费者流程 / 7.2 异常矩阵 |
 | `RecordReader.java` / `RecordReaders.java` | 8.1 读取接口与适配器 |
 | `BatchProcessor.java` / `ItemResult.java` / `BatchFailedException.java` | 8.2 / 8.4 处理契约 |
-| `LineFormatter.java` | 8.3 输出契约 |
+| `RecordFormatter.java` | 8.3 输出契约（成功/错误通道共用） |
 | `PartWriter.java` | 6.1 数据流 / 6.2 分片命名 |
 | `OutputMerger.java` | 5.4 合并流程 / 6.2 目录规范 |
 | `PipelineConfig.java` | 9 配置规格 |
 | `PipelineStats.java` | 10.1 统计指标 |
-| `DemoLineReader/DemoHttpProcessor/DemoLineFormatter/DemoMain` | 11 扩展实践示例 |
+| `DemoLineReader/DemoHttpProcessor/DemoLineFormatter/DemoMain/DemoOrder*` | 11 扩展实践示例 |
+| `BatchResult.java` / `BatchPipeline.java` | 10.1 统计指标（快照） / 一行式入口 |
 
 ### 13.2 术语表
 
@@ -956,21 +958,33 @@ ORD-000095|CUST-00096|45.15	RECORD	UNROUTED:partial_shipped	通道 partial_shipp
 **注意**：`PipelineStats` 的「失败记录合计」只统计 `FAILED` 与 BATCH 牵连记录，不含 fallback；
 fallback 有独立计数（`ChannelRouter.unregisteredTotal()`）。两者不要混看。
 
-### 14.6 v1.1 起移除的旧 API（迁移对照）
+### 14.6 v1.1 / v1.2 移除的旧 API（迁移对照）
 
-v1.0 的二通道写法在通道化改造初期以语法糖形式保留过一段时间，现已**整体移除**，
-内核与配置层只有一套通道 API。旧写法 → 新写法的对照：
+**v1.2（当前）**：formatter 拆分、异常收窄、`OutcomeStatus` 删除。
 
-| v1.0 写法（已移除） | 现在的等价写法 |
+| v1.1 写法（已移除） | v1.2 等价写法 |
+|---|---|
+| `LineFormatter`（三方法，每个通道都要实现） | 所有通道 → `RecordFormatter`（单方法，可 lambda；成功读 payload、错误读 code/message） |
+| `channel(key, file, lineFormatter)` | `channel(key, file, recordFormatter)` —— 类型不同，编译期保证普通通道只配成功格式 |
+| `OutputChannel.of(key, file, fmt)` / `OutputChannel.error(file, fmt)` | 从用户 API 移除，改走 builder 唯一的 `channel(...)` 方法 |
+| `OutputChannel.error(...).createEmpty(true)` | `channel("error", file, fmt, true)` |
+| `channelOf` 里 `if (!result.isSuccess()) return null;` | 删掉——`channelOf` 只对成功记录调用，失败一律自动进错误通道 |
+| `ItemResult.getStatus()` / `OutcomeStatus` | 删除——用 `isSuccess()`，内部是布尔位 |
+| `RecordReader` 方法 `throws Exception` | 收窄为 `throws IOException` |
+| `new FileBatchPipeline<>(config).run()`（void） | `run()` 返回 `BatchResult` 快照；或一行式 `BatchPipeline.run(config)` |
+
+输出格式统一为单个 `RecordFormatter` 后，`channel()` 成为唯一声明方法（成功/错误/业务通道都用它）。
+构建期不再做角色校验与 fail-fast（错误通道缺失会在首次失败时在运行期抛出清晰异常），
+把"信任用户配置、保持 API 简洁"放在"编译期防呆"之前。
+
+**v1.1**：v1.0 的二通道写法（`successFile/errorFile/successFormatter/errorFormatter/createEmptyOutput`）
+整体移除，内核与配置层只有一套通道 API：
+
+| v1.0 写法 | 等价写法 |
 |---|---|
 | `successFile(f)` + `successFormatter(fmt)` | `channel("success", f, fmt)`（保留 key） |
-| `errorFile(f)` + `errorFormatter(fmt)` | `errorChannel(f, fmt)` 或 `channel(OutputChannel.error(f, fmt))` |
-| `createEmptyOutput(true)`（全局） | 对需要的通道单独调 `OutputChannel.of(...).createEmpty(true)` |
-| 处理器只实现 `BatchProcessor` | 不变：路由退化为"成功→success，失败→error" |
-
-`build()` 现在额外做一道角色校验：key 为 `error` 的通道必须用 `OutputChannel.error(...)`
-声明（`isErrorChannel == true`），用 `channel("error", ...)` 声明成普通通道会被直接拒绝——
-否则兜底与批次级失败会写进一个语义上是"普通输出"的通道，下游无法区分。
+| `errorFile(f)` + `errorFormatter(fmt)` | `channel("error", f, fmt)` |
+| `createEmptyOutput(true)`（全局） | 对需要的通道用带 `createEmpty` 参数的重载 |
 
 ### 14.7 明确不支持的两种形态
 

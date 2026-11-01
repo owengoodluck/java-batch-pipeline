@@ -54,10 +54,7 @@ public class DemoOrderProcessor implements RoutingProcessor<String, String> {
     }
 
     public String channelOf(int indexInBatch, String record, ItemResult<String> result) {
-        if (!result.isSuccess()) {
-            // 返回 null 表示走默认规则 → 失败记录进错误通道
-            return null;
-        }
+        // 只会被成功记录调用：失败的记录由内核直接送错误通道，这里无需判断 isSuccess()。
         // 用 code 而不是 payload：code 是稳定标识（PAID/SHIPPED...），payload 里是给人看的中文文案，
         // 拿文案去映射通道，改一次文案就会全线失配。
         String statusName = result.getCode();

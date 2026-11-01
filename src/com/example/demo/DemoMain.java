@@ -1,7 +1,7 @@
 package com.example.demo;
 
-import com.example.batch.FileBatchPipeline;
-import com.example.batch.OutputChannel;
+import com.example.batch.BatchPipeline;
+import com.example.batch.BatchResult;
 import com.example.batch.PipelineConfig;
 import com.example.batch.PipelineExecutionException;
 import com.example.batch.PipelineLog;
@@ -46,9 +46,8 @@ public class DemoMain {
 
         RecordReader<String> reader = createReader(input, mode);
 
-        // 业务方只需提供：processor（真实调用）+ formatter（输出格式）
+        // 业务方只需提供：processor（真实调用）+ 两种 formatter（输出格式）
         DemoHttpProcessor processor = new DemoHttpProcessor(3, 5, 42L); // 3% 批次失败 / 5% 记录失败
-        DemoLineFormatter formatter = new DemoLineFormatter();
 
         PipelineConfig<String, String> config = PipelineConfig.<String, String>builder()
                 .reader(reader)
@@ -59,14 +58,13 @@ public class DemoMain {
                 .awaitTerminationSeconds(60L)
                 .charset(CS)
                 .partsDir(partsDir)
-                // success / error 是两个保留通道 key；这里不实现 RoutingProcessor，
-                // 路由自动退化为"成功 → success，失败 → error"，与最早的二通道行为一致。
+                // 没实现 RoutingProcessor：成功记录自动进 success 通道，失败记录进 error 通道。
                 // createEmpty(true)：无记录时也生成空文件，保持下游"固定文件集"的读法。
-                .channel(OutputChannel.<String, String>of(
-                        OutputChannel.SUCCESS, new File(outputDir, "sample.success"), formatter)
-                        .createEmpty(true))
-                .channel(OutputChannel.<String, String>error(
-                        new File(outputDir, "sample.error"), formatter).createEmpty(true))
+                // success / error 只是两个普通通道 key，都用同一个 channel(...) 声明。
+                .channel("success", new File(outputDir, "sample.success"),
+                        DemoLineFormatter.SUCCESS_TSV, true)
+                .channel("error", new File(outputDir, "sample.error"),
+                        DemoLineFormatter.ERROR_TSV, true)
                 .build();
 
         PipelineLog.info("输入文件: %s（共 %d 行）", input.getAbsolutePath(), TOTAL_LINES);
@@ -74,13 +72,15 @@ public class DemoMain {
                 : "专用 RecordReader 实现");
 
         try {
-            new FileBatchPipeline<String, String>(config).run();
+            BatchResult result = BatchPipeline.run(config);
+            PipelineLog.info("运行结果: %s", result);
         } catch (PipelineExecutionException e) {
             PipelineLog.error("流水线未正常完成: %s", e.getMessage());
+            return;
         }
 
         preview(new File(outputDir, "sample.success"), "主输出文件 sample.success（成功记录）", 5);
-        preview(new File(outputDir, "sample.error"), "错误文件 sample.error（失败记录，含级别列）", 5);
+        preview(new File(outputDir, "sample.error"), "错误文件 sample.error（失败记录）", 5);
     }
 
     // ------------------------------------------------------------ 两种读取接入方式
@@ -91,7 +91,7 @@ public class DemoMain {
             final BufferedReader br = new BufferedReader(
                     new InputStreamReader(new FileInputStream(input), CS));
             return RecordReaders.fromReadFunction(new RecordReaders.ExSupplier<String>() {
-                public String get() throws Exception {
+                public String get() throws java.io.IOException {
                     return br.readLine();
                 }
             });

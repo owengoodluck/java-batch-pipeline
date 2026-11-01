@@ -31,7 +31,7 @@ demo-run/
 ├── parts/                  分片目录（合并成功后自动清理）
 └── output/
     ├── sample.success      主输出：仅成功记录
-    └── sample.error        错误文件：失败记录（含级别列）
+    └── sample.error        错误文件：失败记录
 ```
 
 ---
@@ -40,17 +40,19 @@ demo-run/
 
 ```
 src/com/example/batch/            ← 与业务无关的通用内核（不要改）
-├── RecordReader.java           读取接口（SPI）
+├── RecordReader.java           读取接口（SPI，抛 IOException）
 ├── RecordReaders.java          Iterator / read() 形态的适配器
 ├── BatchProcessor.java         批处理接口（SPI，通常是调 HTTP）
-├── RoutingProcessor.java       按结果分流到不同通道（SPI 的可选扩展）
+├── RoutingProcessor.java       按结果分流到不同通道（SPI 的可选扩展，只对成功记录调用）
 ├── BatchFailedException.java   批次级失败异常（携带错误码）
-├── ItemResult.java / OutcomeStatus.java   单条结果模型
-├── LineFormatter.java          输出行格式化接口（SPI）
-├── OutputChannel.java          输出通道 = 一个目标文件 + 一套行格式
+├── ItemResult.java             单条结果模型（布尔 success 位，无枚举）
+├── RecordFormatter.java        通道行格式（单方法，可 lambda；成功/失败都靠它渲染）
+├── OutputChannel.java          输出通道 = 一个目标文件 + 一套行格式（内部类型）
 ├── ChannelRouter.java          通道路由 + 未注册通道兜底
 ├── PipelineConfig.java         配置 + Builder（通道表 + 参数校验）
-├── PipelineStats.java          统计（行数/批次/通道/状态码/耗时）
+├── PipelineStats.java          统计（行数/批次/通道/状态码/耗时，内部计数）
+├── BatchResult.java            运行结果只读快照（run() 的返回值）
+├── BatchPipeline.java          一行式入口：BatchPipeline.run(config)
 ├── PartWriter.java             分片写入（按通道路由到各自目录）
 ├── OutputMerger.java           分片合并 + 原子 rename
 ├── BatchTask.java              单批任务（异常降级 + 名额归还）
@@ -60,7 +62,7 @@ src/com/example/batch/            ← 与业务无关的通用内核（不要改
 src/com/example/demo/            ← 业务方要写的部分（替换成你的真实实现）
 ├── DemoLineReader.java         RecordReader 的一种实现（文本文件按行读）
 ├── DemoHttpProcessor.java      BatchProcessor 的一种实现（模拟批量 HTTP）
-├── DemoLineFormatter.java      LineFormatter 的实现（平铺格式）
+├── DemoLineFormatter.java      RecordFormatter 实现（成功/错误两套行格式）
 ├── DemoMain.java               装配 + 运行（双输出：成功 / 错误）
 ├── DemoOrderStatus.java        订单状态枚举（其中一个状态故意不注册通道）
 ├── DemoOrderProcessor.java     RoutingProcessor 实现：按查询到的状态分流
@@ -87,11 +89,13 @@ src/com/example/demo/            ← 业务方要写的部分（替换成你的�
 
 ### 2. 分流：成功 / 失败进不同文件
 
-| 情况 | 归属 | 级别列 |
-|---|---|---|
-| 接口正常返回且记录成功 | 主输出文件 | — |
-| 接口正常返回但该条业务失败 | 错误文件 | `RECORD` |
-| 整批调用失败（超时/5xx/连接失败/解析失败） | 错误文件（整批） | `BATCH` |
+| 情况 | 归属 |
+|---|---|
+| 接口正常返回且记录成功 | 主输出文件（success 通道） |
+| 接口正常返回但该条业务失败 | 错误文件（error 通道） |
+| 整批调用失败（超时/5xx/连接失败/解析失败） | 错误文件（整批，error 通道） |
+
+错误文件里的每一行都由同一个 `RecordFormatter` 渲染，格式为 `错误码 \t 错误信息 \t 原始记录`（见 `DemoLineFormatter.ERROR_TSV`）。批次级失败与记录级失败的区别体现在**错误码**上（如批次失败用 `BATCH_*` 前缀），不再单列"级别"列。
 
 批次级失败时整批记录都会被写入错误文件，**一条都不会丢**。
 
@@ -107,13 +111,12 @@ src/com/example/demo/            ← 业务方要写的部分（替换成你的�
 
 ```java
 PipelineConfig.<String, String>builder()
-    .reader(...).processor(new MyOrderProcessor())
-    .partsDir(new File(dir, "parts"))
+    .reader(...).processor(new MyOrderProcessor())   // MyOrderProcessor implements RoutingProcessor
     .channel("paid",      new File(dir, "order.paid"),      fmt)
     .channel("shipped",   new File(dir, "order.shipped"),   fmt)
     .channel("completed", new File(dir, "order.completed"), fmt)
     .channel("cancelled", new File(dir, "order.cancelled"), fmt)
-    .channel(OutputChannel.<String, String>error(new File(dir, "order.error"), fmt))
+    .channel("error", new File(dir, "order.error"), errFmt)   // 错误通道（key 固定 error）
     .build();
 ```
 
@@ -147,7 +150,7 @@ parts/
 
 按通道分子目录，而不是 `part-000001.paid.part`：合并时扫一个目录就够，通道 key 也不必参与文件名转义。
 
-**某个通道这次没有记录**：不会有分片文件，合并阶段自然就知道——不需要额外统计。若下游必须拿到固定文件，用 `channel.createEmpty(true)` 单独打开（`error` 通道建议打开，便于告警侧统一处理）。
+**某个通道这次没有记录**：不会有分片文件，合并阶段自然就知道——不需要额外统计。若下游必须拿到固定文件，用 `channel(key, file, fmt, true)` 单独打开（`channel("error", ..., true)` / `channel("success", ..., true)` 建议打开，便于告警侧统一处理）。
 
 ---
 
@@ -157,8 +160,8 @@ parts/
 
 ```java
 public class MyReader implements RecordReader<MyRecord> {
-    public boolean hasNext() throws Exception { /* … */ }
-    public MyRecord next()  throws Exception { /* … */ }
+    public boolean hasNext() throws IOException { /* … */ }
+    public MyRecord next()  throws IOException { /* … */ }
     public void close() { /* 关流 */ }
 }
 
@@ -189,29 +192,35 @@ public class MyProcessor implements BatchProcessor<MyRecord, MyPayload> {
 
 > 成功/失败的判定由你的 Processor 决定，**内核不解读业务状态码的含义**，因此换任何接口都能复用同一套内核。
 
-**第 3 步：实现 `LineFormatter`**（每种文件类型一套格式）
+**第 3 步：提供输出行格式**（所有通道共用一个 `RecordFormatter` 方法）
 
 ```java
-public class MyFormatter implements LineFormatter<MyRecord, MyPayload> {
-    public String formatSuccess(MyRecord r, ItemResult<MyPayload> res)      { return r.raw()+"\t"+res.getCode()+"\t"+res.getPayload(); }
-    public String formatRecordFailed(MyRecord r, ItemResult<MyPayload> res) { return r.raw()+"\tRECORD\t"+res.getCode()+"\t"+res.getMessage(); }
-    public String formatBatchFailed(MyRecord r, String code, String msg)    { return r.raw()+"\tBATCH\t"+code+"\t"+msg; }
-}
+// 成功通道（如 success / paid）：只会收到成功结果，读 result.getPayload()
+RecordFormatter<MyRecord, MyPayload> okFmt =
+        (r, res) -> r.raw() + "\t" + res.getCode() + "\t" + res.getPayload();
+
+// 错误通道（key="error"）：只会收到失败结果，读 result.getCode() / result.getMessage()
+RecordFormatter<MyRecord, MyPayload> errFmt =
+        (r, res) -> res.getCode() + "\t" + res.getMessage() + "\t" + r.raw();
 ```
 
-然后装配运行：
+然后装配运行（最简形态一行）：
 
 ```java
-new FileBatchPipeline<>(PipelineConfig.<MyRecord, MyPayload>builder()
+BatchResult result = BatchPipeline.run(PipelineConfig.<MyRecord, MyPayload>builder()
         .reader(reader).processor(processor)
         .batchSize(100).consumerThreads(4).bufferBatches(1)
-        .partsDir(partsDir)
-        // 输出是通道表：key → 文件 + 格式。error 通道必须存在（errorChannel 快捷方法）。
-        .channel("success", successFile, formatter)          // 保留 key：未实现 RoutingProcessor 时成功记录落这
-        .errorChannel(errorFile, formatter)                  // 保留 key：失败与未注册路由落这
-        // .channel("review", reviewFile, reviewFormatter)  // 需要分流时再加，配合 RoutingProcessor
-        .build()).run();
+        // 分片目录默认落系统临时区；想观察 parts/ 结构时再用 .partsDir(dir) 显式指定
+        // 输出是通道表：每个通道 = key + 文件 + 同一个 RecordFormatter。
+        .channel("success", successFile, okFmt)        // 成功记录落这（未实现 RoutingProcessor 时接收全部成功）
+        .channel("error",   errorFile,   errFmt)       // 错误与未注册路由落这（key 固定 error）
+        // .channel("review", reviewFile, okFmt)        // 需要分流时再加，配合 RoutingProcessor
+        .build());
+System.out.println(result);   // 读取数、成功/失败、通道分布、耗时
 ```
+
+需要中途停止或查询运行中状态时，改用实例形态 `new FileBatchPipeline<>(config)`，
+拿到 `pipeline` 引用后调 `run()` / `abort(...)` / `getStats()`。
 
 ---
 
@@ -226,7 +235,7 @@ new FileBatchPipeline<>(PipelineConfig.<MyRecord, MyPayload>builder()
 | `charset` | UTF-8 | 读写编码 |
 | `deletePartsOnSuccess` | true | 合并成功后清理分片目录 |
 
-输出侧没有全局的"空文件开关"——它是**每个通道自己的属性**：`OutputChannel.of(...).createEmpty(true)`。默认不生成，需要固定文件集的下游对个别通道打开。
+输出侧没有全局的"空文件开关"——它是**每个通道自己的属性**：`channel(key, file, fmt, true)`。默认不生成，需要固定文件集的下游对个别通道打开（如 `channel("error", file, fmt, true)`）。
 
 **调参建议**：批处理（写库/调接口）通常远慢于"读 100 行文本"，所以 `B = 1` 基本就能消除消费者空等；`B` 再往上加只是白占内存。`consumerThreads` 则取决于接口服务端的并发承受能力。
 
@@ -237,7 +246,7 @@ new FileBatchPipeline<>(PipelineConfig.<MyRecord, MyPayload>builder()
 | 场景 | 内核行为 |
 |---|---|
 | `read()` / `hasNext()` 抛异常 | 置停止标志 → 停止读取与提交 → 等在途批次跑完 → **不合并、不覆盖旧输出文件** → 抛 `PipelineExecutionException` |
-| `BatchProcessor` 抛 `BatchFailedException` | 整批写入错误分片（级别 `BATCH`，错误码取自异常）→ 后续批次继续 |
+| `BatchProcessor` 抛 `BatchFailedException` | 整批写入错误分片（错误码取自异常，如 `BATCH_*`）→ 后续批次继续 |
 | `BatchProcessor` 抛其他异常 | 同上，错误码标 `UNKNOWN`，不拖垮整个文件 |
 | 返回结果条数与批次不符 | 防御降级为整批失败（`BAD_RESPONSE`），避免记录不明丢失 |
 | 写分片失败（磁盘满/权限） | 兜底失效 → 触发全局停止（不静默丢数据） |
@@ -256,8 +265,8 @@ new FileBatchPipeline<>(PipelineConfig.<MyRecord, MyPayload>builder()
 | 1 | 1050 行 → 11 批（含不足 100 条的尾批 50 条） | PASS |
 | 2 | 数据统计守恒：成功 + 记录级失败 + 批次牵连 == 读取总数 | PASS |
 | 3 | 输出文件行数守恒：主输出行数 + 错误文件行数 == 输入行数 | PASS |
-| 4 | 批次级失败时整批 100 条落错误文件且标记 `BATCH` | PASS |
-| 5 | 记录级失败标记 `RECORD`，两者可区分 | PASS |
+| 4 | 批次级失败时整批记录落错误文件（错误码为 `BATCH_*` 前缀） | PASS |
+| 5 | 记录级失败落错误文件（错误码为业务码），与成功记录分流清晰 | PASS |
 | 6 | 消费慢时触发背压（生产者停止提交） | PASS |
 | 7 | 合并后输出保持输入行序 | PASS |
 | 8 | 读取异常时全局停止，且**不覆盖**已有输出文件 | PASS |

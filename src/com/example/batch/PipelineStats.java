@@ -7,7 +7,12 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
-/** 流水线统计指标（线程安全）。 */
+/**
+ * 流水线统计指标（线程安全）。
+ *
+ * <p>内部计数、对外只读：写入方法仅供内核同包调用，使用方通过
+ * {@link FileBatchPipeline#getStats()} 或 {@link BatchResult} 读取。
+ */
 public final class PipelineStats {
 
     private final AtomicLong readCount = new AtomicLong();
@@ -26,44 +31,44 @@ public final class PipelineStats {
     private volatile long startTimeNanos;
     private volatile long endTimeNanos;
 
-    public void start() {
+    void start() {
         startTimeNanos = System.nanoTime();
     }
 
-    public void stop() {
+    void stop() {
         endTimeNanos = System.nanoTime();
     }
 
-    public void addRead(int n) {
+    void addRead(int n) {
         readCount.addAndGet(n);
     }
 
-    public void addSubmitted() {
+    void addSubmitted() {
         batchSubmitted.incrementAndGet();
     }
 
-    public void addBatchOk() {
+    void addBatchOk() {
         batchOk.incrementAndGet();
     }
 
-    public void addBatchFailed() {
+    void addBatchFailed() {
         batchFailed.incrementAndGet();
     }
 
-    public void addRecordSuccess() {
+    void addRecordSuccess() {
         recordSuccess.incrementAndGet();
     }
 
-    public void addRecordFailed() {
+    void addRecordFailed() {
         recordFailed.incrementAndGet();
     }
 
-    public void addRecordBatchFailed() {
+    void addRecordBatchFailed() {
         recordBatchFailed.incrementAndGet();
     }
 
     /** 累加某个输出通道本次写入的行数。 */
-    public void addChannel(String key, int n) {
+    void addChannel(String key, int n) {
         if (key == null || n <= 0) {
             return;
         }
@@ -78,17 +83,9 @@ public final class PipelineStats {
         counter.addAndGet(n);
     }
 
-    /** 通道写入行数快照（key → 行数）。 */
-    public Map<String, Long> getChannelCounts() {
-        Map<String, Long> snapshot = new java.util.LinkedHashMap<String, Long>();
-        for (Map.Entry<String, AtomicLong> e : channelCounts.entrySet()) {
-            snapshot.put(e.getKey(), e.getValue().get());
-        }
-        return snapshot;
-    }
-
     /** 记录错误码出现次数（成功码也记录，便于完整核对）。 */
-    public void addCode(String code) {        if (code == null) {
+    void addCode(String code) {
+        if (code == null) {
             code = "-";
         }
         AtomicLong counter = errorCodeCounts.get(code);
@@ -106,24 +103,9 @@ public final class PipelineStats {
         return readCount.get();
     }
 
-    public long getBatchSubmitted() {
-        return batchSubmitted.get();
-    }
-
-    public long getBatchFailed() {
-        return batchFailed.get();
-    }
-
-    public long getRecordSuccess() {
-        return recordSuccess.get();
-    }
-
-    public long getRecordFailed() {
-        return recordFailed.get();
-    }
-
-    public long getRecordBatchFailed() {
-        return recordBatchFailed.get();
+    /** 通道写入行数快照（key → 行数）。 */
+    public Map<String, Long> getChannelCounts() {
+        return snapshot(channelCounts);
     }
 
     public long elapsedMillis() {
@@ -134,8 +116,25 @@ public final class PipelineStats {
         return (end - startTimeNanos) / 1000000L;
     }
 
+    /** 生成本次运行的只读结果快照（供 {@code run()} 返回）。 */
+    BatchResult snapshot(boolean aborted, Throwable abortCause) {
+        return new BatchResult(
+                readCount.get(), batchSubmitted.get(), batchOk.get(), batchFailed.get(),
+                recordSuccess.get(), recordFailed.get(), recordBatchFailed.get(),
+                snapshot(channelCounts), snapshot(errorCodeCounts),
+                elapsedMillis(), aborted, abortCause);
+    }
+
+    private static Map<String, Long> snapshot(ConcurrentHashMap<String, AtomicLong> map) {
+        Map<String, Long> snapshot = new java.util.LinkedHashMap<String, Long>();
+        for (Map.Entry<String, AtomicLong> e : map.entrySet()) {
+            snapshot.put(e.getKey(), e.getValue().get());
+        }
+        return snapshot;
+    }
+
     /** 打印汇总：行数、批次、成功/失败、状态码分布、耗时。 */
-    public void printSummary() {
+    void printSummary() {
         stop();
         long failedRecord = recordFailed.get() + recordBatchFailed.get();
         long elapsed = elapsedMillis();
@@ -153,19 +152,15 @@ public final class PipelineStats {
             PipelineLog.info("平均每批耗时      : %d ms", elapsed / batchSubmitted.get());
         }
         PipelineLog.info("----- 通道分布（写入行数） -----");
-        List<Map.Entry<String, AtomicLong>> channelEntries =
-                new ArrayList<Map.Entry<String, AtomicLong>>(channelCounts.entrySet());
-        Collections.sort(channelEntries, new java.util.Comparator<Map.Entry<String, AtomicLong>>() {
-            public int compare(Map.Entry<String, AtomicLong> a, Map.Entry<String, AtomicLong> b) {
-                return Long.compare(b.getValue().get(), a.getValue().get());
-            }
-        });
-        for (Map.Entry<String, AtomicLong> e : channelEntries) {
-            PipelineLog.info("%-16s %d", e.getKey(), e.getValue().get());
-        }
+        printSorted(channelCounts);
         PipelineLog.info("----- 状态码分布 -----");
+        printSorted(errorCodeCounts);
+        PipelineLog.info("================================");
+    }
+
+    private static void printSorted(ConcurrentHashMap<String, AtomicLong> map) {
         List<Map.Entry<String, AtomicLong>> entries =
-                new ArrayList<Map.Entry<String, AtomicLong>>(errorCodeCounts.entrySet());
+                new ArrayList<Map.Entry<String, AtomicLong>>(map.entrySet());
         Collections.sort(entries, new java.util.Comparator<Map.Entry<String, AtomicLong>>() {
             public int compare(Map.Entry<String, AtomicLong> a, Map.Entry<String, AtomicLong> b) {
                 return Long.compare(b.getValue().get(), a.getValue().get());
@@ -174,6 +169,5 @@ public final class PipelineStats {
         for (Map.Entry<String, AtomicLong> e : entries) {
             PipelineLog.info("%-16s %d", e.getKey(), e.getValue().get());
         }
-        PipelineLog.info("================================");
     }
 }

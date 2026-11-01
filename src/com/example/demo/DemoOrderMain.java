@@ -1,7 +1,7 @@
 package com.example.demo;
 
-import com.example.batch.FileBatchPipeline;
-import com.example.batch.OutputChannel;
+import com.example.batch.BatchPipeline;
+import com.example.batch.BatchResult;
 import com.example.batch.PipelineConfig;
 import com.example.batch.PipelineLog;
 
@@ -52,7 +52,6 @@ public class DemoOrderMain {
 
         generateOrders(input, total);
 
-        DemoLineFormatter formatter = new DemoLineFormatter();
         PipelineConfig<String, String> config = PipelineConfig.<String, String>builder()
                 .reader(new DemoLineReader(input, UTF8))
                 .processor(new DemoOrderProcessor())
@@ -61,15 +60,17 @@ public class DemoOrderMain {
                 .partsDir(partsDir)
                 // Demo 保留分片目录，便于观察"每个通道一个子目录"的物理结构
                 .deletePartsOnSuccess(false)
-                .channel("paid", new File(outDir, "order.paid"), formatter)
-                .channel("shipped", new File(outDir, "order.shipped"), formatter)
-                .channel("completed", new File(outDir, "order.completed"), formatter)
-                .channel("cancelled", new File(outDir, "order.cancelled"), formatter)
-                .channel(OutputChannel.<String, String>error(
-                        new File(outDir, "order.error"), formatter))
+                // 普通通道只收成功记录：一个 lambda 就是一个通道的格式
+                .channel("paid", new File(outDir, "order.paid"), DemoLineFormatter.SUCCESS_TSV)
+                .channel("shipped", new File(outDir, "order.shipped"), DemoLineFormatter.SUCCESS_TSV)
+                .channel("completed", new File(outDir, "order.completed"), DemoLineFormatter.SUCCESS_TSV)
+                .channel("cancelled", new File(outDir, "order.cancelled"), DemoLineFormatter.SUCCESS_TSV)
+                // 错误通道收两类失败行：查询失败（RECORD）与未注册状态兜底
+                .channel("error", new File(outDir, "order.error"), DemoLineFormatter.ERROR_TSV)
                 .build();
 
-        new FileBatchPipeline<String, String>(config).run();
+        BatchResult result = BatchPipeline.run(config);
+        PipelineLog.info("运行结果: %s", result);
 
         report(workDir, total);
     }

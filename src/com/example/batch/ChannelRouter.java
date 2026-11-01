@@ -7,20 +7,22 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * 通道路由器：把「一条记录 + 它的处理结果」解析成一个**已注册**的通道 key。
  *
- * <p>解析顺序：
+ * <p>路由规则刻意保持简单，只有两条：
  * <ol>
- *   <li>处理器实现了 {@link RoutingProcessor} → 用它给的 key；</li>
- *   <li>返回 {@code null} → 按结果状态走默认（成功 → {@code success}，失败 → {@code error}）；</li>
- *   <li>key 不在配置里 → 落错误通道，标记为 fallback，并计入「未注册路由」统计。</li>
+ *   <li><b>失败的记录一律进错误通道</b>——不需要任何配置，{@link RoutingProcessor#channelOf}
+ *       也只对成功记录调用，因此"失败记录被路由进业务通道"这类歧义从模型上就不存在；</li>
+ *   <li><b>成功的记录</b>：处理器实现了 {@link RoutingProcessor} → 用它给的 key；
+ *       没实现或返回 {@code null} → 进 {@code success} 通道。</li>
  * </ol>
  *
- * <p>第三步是这套设计的安全阀。允许"边跑边建通道"看起来更灵活，但代价是
- * 一个大小写错误或多余空格就会静默产出一组没人读的文件，且不报错——等对账时才发现少了数据。
- * 白名单 + 兜底 + 计数，能把这类事故压缩成一条明确的日志。
+ * <p>另外一道安全阀：<b>返回了未注册的 key，不会动态建通道</b>，而是兜底到错误通道并计数告警。
+ * 允许"边跑边建通道"看起来更灵活，但代价是一个大小写错误或多余空格就会静默产出
+ * 一组没人读的文件，且不报错——等对账时才发现少了数据。白名单 + 兜底 + 计数，
+ * 能把这类事故压缩成一条明确的日志。
  *
- * <p>fallback 必须被上层感知：这类记录往往"业务上是成功的"，如果按成功格式写进错误文件，
- * 错误文件里就会混入不同列数的行，下游解析直接错位。因此 {@link PartWriter} 会为它们
- * 合成一条 UNROUTED 失败结果，强制走错误格式。
+ * <p>兜底记录往往"业务上是成功的"，如果按成功格式写进错误文件，错误文件里就会
+ * 混入不同列数的行，下游解析直接错位。因此 {@link PartWriter} 会为它们合成一条
+ * UNROUTED 失败结果，强制走错误格式。
  *
  * <p>线程安全：由多个消费者线程并发调用。
  */
@@ -60,6 +62,8 @@ public final class ChannelRouter<T, P> {
     private final String errorKey;
     private final ConcurrentHashMap<String, AtomicLong> unregistered =
             new ConcurrentHashMap<String, AtomicLong>();
+    /** 成功记录被显式指到错误通道的次数（该通道只收失败行，会被拨回 success）。 */
+    private final AtomicLong successToError = new AtomicLong();
 
     ChannelRouter(PipelineConfig<T, P> config) {
         this.processor = config.getProcessor();
@@ -68,14 +72,27 @@ public final class ChannelRouter<T, P> {
     }
 
     public Route resolve(int indexInBatch, T record, ItemResult<P> result) {
-        String requested = null;
-        if (processor instanceof RoutingProcessor) {
-            requested = ((RoutingProcessor<T, P>) processor).channelOf(indexInBatch, record, result);
+        final String requested;
+        final String key;
+        if (result.isSuccess()) {
+            requested = (processor instanceof RoutingProcessor)
+                    ? ((RoutingProcessor<T, P>) processor).channelOf(indexInBatch, record, result)
+                    : null;
+            if (requested == null) {
+                key = OutputChannel.SUCCESS;
+            } else if (errorKey.equals(requested)) {
+                // 错误通道只收失败行（同一个 RecordFormatter 只渲染失败结果）：
+                // 成功记录指过来无法落盘，拨回 success 并一次性告警
+                noteSuccessToError(indexInBatch, record);
+                key = OutputChannel.SUCCESS;
+            } else {
+                key = requested;
+            }
+        } else {
+            requested = null;
+            key = errorKey;
         }
-        String key = requested;
-        if (key == null) {
-            key = result.isSuccess() ? OutputChannel.SUCCESS : OutputChannel.ERROR;
-        }
+
         if (channels.containsKey(key)) {
             return new Route(key, requested, false);
         }
@@ -84,15 +101,7 @@ public final class ChannelRouter<T, P> {
     }
 
     private void noteUnregistered(String key, int indexInBatch, T record) {
-        AtomicLong counter = unregistered.get(key);
-        if (counter == null) {
-            counter = new AtomicLong();
-            AtomicLong prev = unregistered.putIfAbsent(key, counter);
-            if (prev != null) {
-                counter = prev;
-            }
-        }
-        long n = counter.incrementAndGet();
+        long n = increment(unregistered, key);
         if (n == 1L) {
             // 只报首次，避免一个批次 100 条刷 100 行日志；总次数在汇总里给
             PipelineLog.warn("未注册的输出通道 \"%s\"（批次内下标 %d，记录 %s），已兜底到 \"%s\"。"
@@ -101,18 +110,52 @@ public final class ChannelRouter<T, P> {
         }
     }
 
+    private void noteSuccessToError(int indexInBatch, T record) {
+        long n = successToError.incrementAndGet();
+        if (n == 1L) {
+            PipelineLog.warn("成功记录被指到错误通道 \"%s\"（批次内下标 %d，记录 %s），"
+                            + "已拨回 \"%s\" 通道。错误通道只承载失败行。",
+                    errorKey, indexInBatch, String.valueOf(record), OutputChannel.SUCCESS);
+        }
+    }
+
+    private static long increment(ConcurrentHashMap<String, AtomicLong> map, String key) {
+        AtomicLong counter = map.get(key);
+        if (counter == null) {
+            counter = new AtomicLong();
+            AtomicLong prev = map.putIfAbsent(key, counter);
+            if (prev != null) {
+                counter = prev;
+            }
+        }
+        return counter.incrementAndGet();
+    }
+
     /** 未注册通道的命中次数快照（key → 次数）。 */
     public Map<String, Long> unregisteredSnapshot() {
+        return snapshot(unregistered);
+    }
+
+    public long unregisteredTotal() {
+        return total(unregistered);
+    }
+
+    /** 成功记录被指到错误通道的次数（已被自动拨回 success）。 */
+    public long successToErrorTotal() {
+        return successToError.get();
+    }
+
+    private static Map<String, Long> snapshot(ConcurrentHashMap<String, AtomicLong> map) {
         Map<String, Long> snapshot = new java.util.LinkedHashMap<String, Long>();
-        for (Map.Entry<String, AtomicLong> e : unregistered.entrySet()) {
+        for (Map.Entry<String, AtomicLong> e : map.entrySet()) {
             snapshot.put(e.getKey(), e.getValue().get());
         }
         return snapshot;
     }
 
-    public long unregisteredTotal() {
+    private static long total(ConcurrentHashMap<String, AtomicLong> map) {
         long total = 0L;
-        for (AtomicLong v : unregistered.values()) {
+        for (AtomicLong v : map.values()) {
             total += v.get();
         }
         return total;

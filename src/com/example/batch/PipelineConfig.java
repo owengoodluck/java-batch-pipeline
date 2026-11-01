@@ -9,24 +9,30 @@ import java.util.Map;
 /**
  * 流水线配置（Builder 装配）。业务相关的能力全部由 SPI 注入，配置本身不含业务逻辑。
  *
- * <p>输出侧是一张**通道表**：每个通道 = 一个目标文件 + 一套行格式。
- * 通道在 build() 时全部声明完毕，运行时只允许路由到已声明的 key（详见 {@link OutputChannel}）：
+ * <p>输出侧是一张<b>通道表</b>：每个通道 = 一个目标文件 + 一套行格式（{@link RecordFormatter}）。
+ * 通道在 build() 时全部声明完毕，运行时只允许路由到已声明的 key：
  * <pre>
  * PipelineConfig.&lt;String, String&gt;builder()
- *     .reader(reader).processor(processor)
- *     .channel("paid",    new File(dir, "order.paid"),    fmt)
- *     .channel("shipped", new File(dir, "order.shipped"), fmt)
- *     .channel(OutputChannel.&lt;String, String&gt;error(new File(dir, "order.error"), fmt))
+ *     .reader(reader)
+ *     .processor(processor)
+ *     .channel("success", new File(dir, "order.success"), successFormatter)  // 成功记录落这里
+ *     .channel("paid",    new File(dir, "order.paid"),    paidFormatter)    // 额外分流通道
+ *     .channel("error",   new File(dir, "order.error"),   errFormatter)      // 失败记录落这里
  *     .build();
  * </pre>
  *
- * <p>两条硬性规则：
+ * <p>三类约定（不是三种 API，都是同一个 {@code channel(...)}）：
  * <ul>
- *   <li><b>错误通道必须存在</b>：记录级失败、批次级失败、未注册路由都写这里，
- *       用 {@link OutputChannel#error} 声明；</li>
- *   <li><b>空文件策略是 per-channel 的</b>：默认不生成，需要固定文件集的下游
- *       对单个通道调 {@code createEmpty(true)}。</li>
+ *   <li><b>success</b>：未实现 {@link RoutingProcessor} 时，所有成功记录的默认去向；
+ *       实现了时它可作 {@code channelOf} 返回 null 的兜底。</li>
+ *   <li><b>error</b>（key 固定为 {@code "error"}）：记录级失败、批次级失败、未注册路由全部落这里，
+ *       一个通道即可，只收失败结果。</li>
+ *   <li><b>其它 key</b>（paid / shipped …）：配合 {@link RoutingProcessor#channelOf} 按业务状态再分流。</li>
  * </ul>
+ *
+ * <p>所有通道共用同一个 {@link RecordFormatter} 类型：普通通道只看到成功记录，错误通道只看到失败记录，
+ * 由路由保证。空文件策略是 per-channel 的：默认不生成，需要固定文件集的下游用带
+ * {@code createEmpty} 参数的重载打开。
  *
  * @param <T> 原始记录类型
  * @param <P> 附加内容类型
@@ -67,9 +73,9 @@ public final class PipelineConfig<T, P> {
         return new Builder<T, P>();
     }
 
-    /** 在途批次上限 = 并行消费者数 + 缓冲位数。小于 consumerThreads 时自动抬升。 */
+    /** 在途批次上限 = 并行消费者数 + 缓冲位数。 */
     public int maxInflightBatches() {
-        return Math.max(consumerThreads, consumerThreads + bufferBatches);
+        return consumerThreads + bufferBatches;
     }
 
     public RecordReader<T> getReader() {
@@ -149,23 +155,23 @@ public final class PipelineConfig<T, P> {
             return this;
         }
 
-        /** 声明一个输出通道（可声明任意多个，声明顺序即合并顺序）。 */
-        public Builder<T, P> channel(OutputChannel<T, P> channel) {
-            if (channel == null) {
-                throw new IllegalArgumentException("channel 不能为 null");
+        /** 声明一个输出通道：成功或失败结果都交给同一个 {@link RecordFormatter} 渲染。 */
+        public Builder<T, P> channel(String key, File target, RecordFormatter<T, P> formatter) {
+            return channel(key, target, formatter, false);
+        }
+
+        /** 声明一个输出通道，并指定无数据时是否仍生成空文件。 */
+        public Builder<T, P> channel(String key, File target, RecordFormatter<T, P> formatter,
+                                     boolean createEmpty) {
+            return add(OutputChannel.of(key, target, formatter, createEmpty));
+        }
+
+        private Builder<T, P> add(OutputChannel<T, P> channel) {
+            OutputChannel<T, P> prev = channels.put(channel.getKey(), channel);
+            if (prev != null) {
+                throw new IllegalArgumentException("通道 key 重复声明: " + channel.getKey());
             }
-            this.channels.put(channel.getKey(), channel);
             return this;
-        }
-
-        /** 声明一个普通输出通道的快捷写法，默认不生成空文件。 */
-        public Builder<T, P> channel(String key, File target, LineFormatter<T, P> formatter) {
-            return channel(OutputChannel.of(key, target, formatter));
-        }
-
-        /** 声明错误通道的快捷写法：承载记录级失败、批次级失败与未注册路由。 */
-        public Builder<T, P> errorChannel(File target, LineFormatter<T, P> formatter) {
-            return channel(OutputChannel.error(target, formatter));
         }
 
         public Builder<T, P> batchSize(int v) {
@@ -219,29 +225,20 @@ public final class PipelineConfig<T, P> {
             if (bufferBatches < 0) {
                 throw new IllegalArgumentException("bufferBatches 不能为负");
             }
+
+            // 分片目录默认落到系统临时区；想观察 parts/ 结构时再显式指定。
             if (partsDir == null) {
-                throw new IllegalArgumentException("partsDir 必填");
+                try {
+                    partsDir = java.nio.file.Files.createTempDirectory("batch-pipeline").toFile();
+                } catch (java.io.IOException e) {
+                    throw new IllegalStateException(
+                            "无法创建默认分片目录，请用 partsDir(...) 显式指定", e);
+                }
             }
 
             Map<String, OutputChannel<T, P>> resolved =
                     new LinkedHashMap<String, OutputChannel<T, P>>(channels);
-
-            // 错误通道必须存在且必须声明为错误角色：记录级失败、批次级失败、未注册路由都写这里
-            String errorKey = OutputChannel.ERROR;
-            OutputChannel<T, P> errorChannel = resolved.get(errorKey);
-            if (errorChannel == null) {
-                throw new IllegalArgumentException(
-                        "必须声明错误通道：请用 errorChannel(file, formatter)，"
-                                + "或 channel(OutputChannel.error(file, formatter))");
-            }
-            if (!errorChannel.isErrorChannel()) {
-                throw new IllegalArgumentException(
-                        "通道 \"" + errorKey + "\" 已声明，但不是错误通道："
-                                + "请改用 errorChannel(file, formatter) 声明，"
-                                + "否则兜底与批次级失败会写进一个普通通道");
-            }
-
-            return new PipelineConfig<T, P>(this, resolved, errorKey);
+            return new PipelineConfig<T, P>(this, resolved, OutputChannel.ERROR);
         }
     }
 }

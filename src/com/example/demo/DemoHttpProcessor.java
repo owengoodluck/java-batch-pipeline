@@ -29,16 +29,20 @@ public class DemoHttpProcessor implements BatchProcessor<String, String> {
 
     private final int batchFailPercent;
     private final int recordFailPercent;
-    private final Random rng;
+    private final long seed;
 
     public DemoHttpProcessor(int batchFailPercent, int recordFailPercent, long seed) {
         this.batchFailPercent = batchFailPercent;
         this.recordFailPercent = recordFailPercent;
-        this.rng = new Random(seed);
+        this.seed = seed;
     }
 
     public List<ItemResult<String>> process(List<String> batch, long batchSeq)
             throws BatchFailedException {
+        // 每个批次用「固定 seed + 批次号」派生独立随机数，保证同一输入每次运行结果完全一致，
+        // 且各消费者线程之间互不干扰（不再共享一个 Random）。
+        Random rng = new Random(seed ^ batchSeq);
+
         // 模拟网络耗时：80~220ms
         int cost = 80 + rng.nextInt(140);
         try {

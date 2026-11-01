@@ -67,7 +67,12 @@ public final class FileBatchPipeline<T, P> {
 
     // ------------------------------------------------------------------ 主流程
 
-    public void run() throws PipelineExecutionException {
+    /**
+     * 运行整个流水线，正常结束时返回只读统计快照。
+     *
+     * @throws PipelineExecutionException 读取失败、写分片失败、被中断或外部 abort 时抛出
+     */
+    public BatchResult run() throws PipelineExecutionException {
         stats.start();
         installShutdownHook();
         Throwable fatal = null;
@@ -76,7 +81,7 @@ public final class FileBatchPipeline<T, P> {
             semaphore = new Semaphore(config.maxInflightBatches());
             pool = createPool();
             router = new ChannelRouter<T, P>(config);
-            partWriter = new PartWriter<T, P>(config.getPartsDir(), config.getCharset(), config, router);
+            partWriter = new PartWriter<T, P>(config, router);
             PipelineLog.info("启动流水线: batchSize=%d consumers=%d buffer=%d maxInflight=%d channels=%s",
                     config.getBatchSize(), config.getConsumerThreads(), config.getBufferBatches(),
                     config.maxInflightBatches(), config.getChannels().keySet());
@@ -118,6 +123,7 @@ public final class FileBatchPipeline<T, P> {
                     + (abortCause == null ? String.valueOf(fatal) : String.valueOf(abortCause.getMessage())),
                     abortCause != null ? abortCause : fatal);
         }
+        return stats.snapshot(false, null);
     }
 
     // ------------------------------------------------------------------ 生产者
@@ -147,8 +153,12 @@ public final class FileBatchPipeline<T, P> {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             abort(e);
-        } catch (Throwable t) {
+        } catch (IOException e) {
             // 读取异常按约定终止整个流程：不再新提交批次，等在途批次跑完
+            PipelineLog.error("读取记录失败，触发全局停止: %s", String.valueOf(e.getMessage()));
+            abort(e);
+        } catch (Throwable t) {
+            // 兜底：读取实现抛出的任何其他异常同样触发全局停止
             PipelineLog.error("读取记录失败，触发全局停止: %s", String.valueOf(t.getMessage()));
             abort(t);
         }
@@ -208,12 +218,18 @@ public final class FileBatchPipeline<T, P> {
 
     /** 未注册通道是数据被错误分流的唯一信号，必须在收尾时显式告警，不能只留在日志中间。 */
     private void reportUnregisteredChannels() {
-        if (router == null || router.unregisteredTotal() == 0L) {
+        if (router == null) {
             return;
         }
-        PipelineLog.warn("存在未注册的输出通道：共 %d 条记录被兜底到 \"%s\"，分布 %s",
-                router.unregisteredTotal(), config.getErrorChannelKey(),
-                router.unregisteredSnapshot());
+        if (router.unregisteredTotal() > 0L) {
+            PipelineLog.warn("存在未注册的输出通道：共 %d 条记录被兜底到 \"%s\"，分布 %s",
+                    router.unregisteredTotal(), config.getErrorChannelKey(),
+                    router.unregisteredSnapshot());
+        }
+        if (router.successToErrorTotal() > 0L) {
+            PipelineLog.warn("共 %d 条成功记录被指到错误通道，已拨回 \"%s\" 通道",
+                    router.successToErrorTotal(), OutputChannel.SUCCESS);
+        }
     }
 
     private void releaseResources() {
