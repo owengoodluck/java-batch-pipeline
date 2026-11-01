@@ -24,6 +24,7 @@ mvn compile          # 用 Maven 编译到 target/classes（run.sh 内部也是�
 | `java -cp target/classes com.example.demo.DemoMain` | 专用 `RecordReader` 实现读取 |
 | `java -cp target/classes com.example.demo.DemoMain demo-run adapter` | 用适配器把 `read()` 形态的读取工具接进来 |
 | `java -cp target/classes com.example.demo.DemoOrderMain order-demo 1000` | 多通道：1000 条订单按状态分流到 4 个业务文件 + 1 个错误文件 |
+| `java -cp target/classes com.example.demo.DemoGroupMain demo-run/group` | 分组：输入按 `key` 字段内置分组，每攒满一批同组记录才调一次下游（单组保证，无需全量读入内存） |
 
 产物位于 `demo-run/`：
 
@@ -51,7 +52,11 @@ src/main/java/com/example/batch/            ← 通用内核（Maven 标准布�
 ├── RecordFormatter.java        通道行格式（单方法，可 lambda；成功/失败都靠它渲染）
 ├── OutputChannel.java          输出通道 = 一个目标文件 + 一套行格式（内部类型）
 ├── ChannelRouter.java          通道路由 + 未注册通道兜底
-├── PipelineConfig.java         配置 + Builder（通道表 + 参数校验）
+├── PipelineConfig.java         配置 + Builder（通道表 + 参数校验 + 可选 groupBy 分组）
+├── GroupKeyExtractor.java      分组键提取器（SPI，从记录取分组键；允许抛 IOException）
+├── BatchingStrategy.java       「如何成批」策略接口（默认按数量 / 分组按 key）
+├── CountBatchingStrategy.java  默认攒批策略：按到达顺序 + batchSize 切批
+├── GroupBatchingStrategy.java  内置分组策略：按 key 入桶，满 batchSize 整桶作为单组批次
 ├── PipelineStats.java          统计（行数/批次/通道/状态码/耗时，内部计数）
 ├── BatchResult.java            运行结果只读快照（run() 的返回值）
 ├── BatchPipeline.java          一行式入口：BatchPipeline.run(config)
@@ -68,7 +73,12 @@ src/main/java/com/example/demo/            ← 示例业务实现（替换成你
 ├── DemoMain.java               装配 + 运行（双输出：成功 / 错误）
 ├── DemoOrderStatus.java        订单状态枚举（其中一个状态故意不注册通道）
 ├── DemoOrderProcessor.java     RoutingProcessor 实现：按查询到的状态分流
-└── DemoOrderMain.java          装配 + 运行（多通道：4 个业务文件 + 1 个错误通道）
+├── DemoOrderMain.java          装配 + 运行（多通道：4 个业务文件 + 1 个错误通道）
+├── DemoGroupRecord.java        分组演示的记录（带分组键字段 key）
+├── DemoGroupReader.java        RecordReader：按行解析出 key + payload
+├── DemoGroupProcessor.java     BatchProcessor：模拟"同一组发往专属下游"
+├── DemoGroupFormatter.java     RecordFormatter：成功/错误行格式
+└── DemoGroupMain.java          装配 + 运行（内置分组：按 key 字段分组，每满一批同组记录才调下游）
 ```
 
 ---
@@ -153,6 +163,33 @@ parts/
 按通道分子目录，而不是 `part-000001.paid.part`：合并时扫一个目录就够，通道 key 也不必参与文件名转义。
 
 **某个通道这次没有记录**：不会有分片文件，合并阶段自然就知道——不需要额外统计。若下游必须拿到固定文件，用 `channel(key, file, fmt, true)` 单独打开（`errorChannel(file, fmt, true)` / `channel("success", ..., true)` 建议打开，便于告警侧统一处理）。
+
+### 5. 分组：批量前按字段分组（内置，单组保证）
+
+有时读进来的记录不能直接进 `BatchProcessor`，要先**按某字段分成多组**，让每次下游调用只含一个组（例如按客户号/仓库分组，下游接口要求同组才放行）。
+
+框架的"批"原本是**传输层概念**（按 `batchSize` 数量攒批，为了并发与背压），分组是另一个维度——内置分组把二者合一：启用后，框架每读一条记录就按分组键入桶，**某个桶攒满 `batchSize` 即作为一个「单组批次」提交下游**。于是每次 `process()` 收到的批次**只含同一个分组键**（单组保证），其余编排、背压、落盘逻辑完全不变。
+
+启用方式（一行 SPI，其余代码零改动）：
+
+```java
+PipelineConfig.<MyRec, String>builder()
+    .reader(reader).processor(processor)
+    .groupBy(r -> r.getGroupKey())          // ← 内置分组：按字段取分组键
+    .batchSize(50)
+    .channel("success", successFile, okFmt)
+    .errorChannel(errorFile, errFmt)
+    .build();
+```
+
+**关键事实（务必理解）**：
+
+- **单组保证**：每次下游调用只含同一个分组键。整组超过 `batchSize` 会被切成多个「单组批次」，每个仍是单组；输入结束时各桶未满的尾批会兜底提交，**不丢数据**。
+- **内存有界**：任意时刻驻留 ≤ 组数 × (batchSize−1)，与输入总量 N 无关——**不需要把全部记录读进内存**。这正是它优于"先全量读入再分组"的根本原因。
+- **硬约束：分组键的不同值数量必须有界且较小（低基数）**，典型如租户 / 地区 / 渠道（几十到几百）。高基数（如按用户 ID）会出现大量攒不满的桶、内存重新变无界——高基数应改用外部分文件预处理，不要靠本能力。
+- 不调用 `groupBy`（默认）时，行为等价于"按数量切批"，与旧版本完全一致（向后兼容）。
+
+**与「processor 内分组」的边界**：如果你只想"同批里同组的记录一起发"，可在 `BatchProcessor` 内对框架按数量给的一批做 `groupBy` 再分别调下游——更省事，但分组只在当前这批内有效，组恰好跨在 batch 边界会被拆成两次调用。需要"**严格单组保证 + 内存有界**"时才用上面的内置 `groupBy`。完整示例见 `DemoGroupMain`。
 
 ---
 

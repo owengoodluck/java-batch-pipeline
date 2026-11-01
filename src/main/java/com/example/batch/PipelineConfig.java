@@ -55,6 +55,9 @@ public final class PipelineConfig<T, P> {
     private final Map<String, OutputChannel<T, P>> channels;
     private final String errorChannelKey;
 
+    /** 分组键提取器（可选）。为 null 时按数量攒批（默认策略）；非 null 时启用内置分组。 */
+    private final GroupKeyExtractor<T, ?> groupExtractor;
+
     private PipelineConfig(Builder<T, P> b, Map<String, OutputChannel<T, P>> channels, String errorChannelKey) {
         this.reader = b.reader;
         this.processor = b.processor;
@@ -67,6 +70,7 @@ public final class PipelineConfig<T, P> {
         this.partsDir = b.partsDir;
         this.channels = Collections.unmodifiableMap(channels);
         this.errorChannelKey = errorChannelKey;
+        this.groupExtractor = b.groupExtractor;
     }
 
     public static <T, P> Builder<T, P> builder() {
@@ -128,6 +132,14 @@ public final class PipelineConfig<T, P> {
         return errorChannelKey;
     }
 
+    /**
+     * 分组键提取器；null 表示不分组（走默认按数量攒批策略）。
+     * 非 null 时启用内置分组批处理：每条记录先按键入桶，某桶攒满 batchSize 即作为一个单组批次提交。
+     */
+    public GroupKeyExtractor<T, ?> getGroupExtractor() {
+        return groupExtractor;
+    }
+
     public static final class Builder<T, P> {
 
         private RecordReader<T> reader;
@@ -141,6 +153,9 @@ public final class PipelineConfig<T, P> {
         private boolean deletePartsOnSuccess = true;
 
         private File partsDir;
+
+        /** 分组键提取器（可选）。null = 不分组，走默认按数量攒批。 */
+        private GroupKeyExtractor<T, ?> groupExtractor;
 
         private final Map<String, OutputChannel<T, P>> channels =
                 new LinkedHashMap<String, OutputChannel<T, P>>();
@@ -223,6 +238,23 @@ public final class PipelineConfig<T, P> {
 
         public Builder<T, P> partsDir(File v) {
             this.partsDir = v;
+            return this;
+        }
+
+        /**
+         * 启用<b>内置分组批处理</b>：每条记录先按 {@code extractor} 取出分组键，再按键归桶；
+         * 某个桶攒满 batchSize 即作为一个「单组批次」提交给 {@link com.example.batch.BatchProcessor}。
+         *
+         * <p>启用后，每次下游调用<b>只含同一个分组键</b>的记录（单组保证）；整组超过 batchSize 会被切成
+         * 多个「单组批次」，每个仍是单组；输入结束时会把各桶未满的尾批兜底提交，不丢数据。
+         *
+         * <p><b>硬约束</b>：分组键的<b>不同值数量必须有界且较小（低基数）</b>——如租户 / 地区 / 渠道。
+         * 高基数（如用户 ID）会撑爆内存，不适用本能力（需要的话应改用外部分文件预处理）。
+         *
+         * <p>不调用本方法（默认 null）时，行为等价于「按数量切批」，与旧版本完全一致。
+         */
+        public <K> Builder<T, P> groupBy(GroupKeyExtractor<T, K> extractor) {
+            this.groupExtractor = extractor;
             return this;
         }
 

@@ -39,7 +39,11 @@ java-batch-pipeline/
 │   │   ├── RecordFormatter.java     输出行格式（单方法）
 │   │   ├── OutputChannel.java       通道定义（key + 文件 + formatter）
 │   │   ├── ChannelRouter.java       路由 + 未注册兜底
-│   │   ├── PipelineConfig.java      配置 + Builder（通道表 + 校验）
+│   │   ├── PipelineConfig.java      配置 + Builder（通道表 + 校验 + 可选 groupBy 分组）
+│   │   ├── GroupKeyExtractor.java   分组键提取器（SPI，从记录取分组键，允许抛 IOException）
+│   │   ├── BatchingStrategy.java    「如何成批」策略接口（默认按数量 / 分组按 key）
+│   │   ├── CountBatchingStrategy.java  默认攒批策略：按到达顺序 + batchSize 切批
+│   │   ├── GroupBatchingStrategy.java  内置分组策略：按 key 入桶，满 batchSize 整桶作单组批次
 │   │   ├── BatchResult.java         运行结果只读快照（run() 的返回值）
 │   │   ├── BatchPipeline.java       一行式入口：BatchPipeline.run(config)
 │   │   ├── FileBatchPipeline.java   内核编排（生产者/背压/合并/停机）
@@ -49,6 +53,8 @@ java-batch-pipeline/
 │   └── demo/                    ← 示例业务实现（替换成你的真实实现）
 │       ├── DemoLineReader.java / DemoHttpProcessor.java / DemoLineFormatter.java
 │       ├── DemoMain.java（双输出）/ DemoOrderMain.java + DemoOrder*（多通道）
+│       ├── DemoGroupRecord.java / DemoGroupReader.java / DemoGroupProcessor.java
+│       │   / DemoGroupFormatter.java / DemoGroupMain.java（内置分组：按 key 字段分组，每满一批同组记录才调下游）
 └── run.sh                       ← 一键 Maven 编译并跑两个 Demo
 ```
 
@@ -56,9 +62,10 @@ java-batch-pipeline/
 
 ```bash
 mvn compile                                   # 编译到 target/classes
-java -cp target/classes com.example.demo.DemoMain            # 跑主 Demo
+java -cp target/classes com.example.demo.DemoMain            # 跑主 Demo（双输出）
 java -cp target/classes com.example.demo.DemoOrderMain      # 跑多通道 Demo
-# 或：./run.sh（自动 mvn compile 后依次跑两个 Demo）
+java -cp target/classes com.example.demo.DemoGroupMain      # 跑内置分组 Demo（按 key 分组）
+# 或：./run.sh（自动 mvn compile 后依次跑上述三个 Demo）
 ```
 
 ---
@@ -202,6 +209,36 @@ public String channelOf(int indexInBatch, String record, ItemResult<String> resu
 
 改用实例形态：`new FileBatchPipeline<>(config).run()`，拿到引用后可调 `run()` / `abort(...)` / `getStats()`。
 
+### 5.4 批量前按字段分组（内置分组，单组保证）
+
+需求：读进来的记录不能原样进 `BatchProcessor`，而要**先按某字段分成多组**，让每次下游调用只含一个组（如按客户号/仓库分组，下游接口要求同组才放行）。
+
+框架的"批"原本是**传输层概念**（按数量攒批，为并发与背压服务），分组是另一维度——内置分组把二者合一：启用后，框架每读一条记录就按分组键入桶，**某桶攒满 `batchSize` 即作为一个「单组批次」提交下游**。于是每次 `process()` 收到的 batch **只含同一个分组键**（单组保证），其余编排、背压、落盘逻辑不变。
+
+启用方式（一行 SPI，其余代码零改动）：
+
+```java
+PipelineConfig.<MyRec, String>builder()
+    .reader(reader).processor(processor)
+    .groupBy(r -> r.getGroupKey())          // ← 内置分组：按字段取分组键（允许抛 IOException）
+    .batchSize(50)                          // 作为“每桶 flush 阈值”
+    .channel("success", ...).errorChannel(...)
+    .build();
+```
+
+`groupBy` 接收一个 `GroupKeyExtractor<T, K>`（函数式接口，`K extract(T) throws IOException`）。底层把"如何成批"抽成 `BatchingStrategy<T>` 策略：默认 `CountBatchingStrategy`（按数量切批，字节级等价于旧版），配置分组时用 `GroupBatchingStrategy`（按 key 分桶、满 `batchSize` flush、EOF 兜底 flush）。不配置 `groupBy` 时走默认策略，老行为完全不变。
+
+**关键事实（务必理解）**：
+
+- **单组保证**：每次下游调用只含同一个分组键。整组超过 `batchSize` 会被切成多个"单组批次"，每个仍是单组；输入结束时各桶未满的尾批会兜底提交，**不丢数据**。
+- **内存有界**：任意时刻驻留 ≤ 组数 × (batchSize−1)，与输入总量 N 无关——**不需要把全部记录读进内存**。这正是它优于"先全量读入再分组"的根本原因（后者 O(N) 内存，数据量大即 OOM）。
+- **硬约束：分组键的不同值数量必须有界且较小（低基数）**，典型如租户/地区/渠道（几十到几百）。高基数（如按用户 ID）会撑爆内存，应改用**外部分文件预处理**（按 key 落不同文件后各自跑流水线），不要靠本能力。
+- **未配置 `groupBy` 时**：行为与旧版本完全一致（向后兼容）。
+
+**与「processor 内分组」的边界**：只想"同批里同组的记录一起发"，可在 `BatchProcessor` 内对框架按数量给的一批做 `groupBy` 再分别调下游——更省事，但分组只在当前这批内有效，组跨 batch 边界会被拆成两次调用。需要"**严格单组保证 + 内存有界**"时才用上面的内置 `groupBy`。
+
+完整可运行示例见 `com.example.demo.DemoGroupMain`（输入 G1/G2/G3 交错，按 `key` 内置分组，输出 `output/group.success` 与 `group.error`；processor 会断言每批单组并打印组号）。
+
 ---
 
 ## 6. 参数（Builder 默认值）
@@ -266,7 +303,7 @@ public String channelOf(int indexInBatch, String record, ItemResult<String> resu
 
 - **仅 Java 8 语法**；内核零第三方运行时依赖（真实业务所需的 HTTP/DB 驱动由使用方自行引入）。
 - **构建**：用 Maven（`mvn compile`），不要手写 javac 命令或维护 `out/` 目录。
-- **不要修改 `com.example.batch` 内核**，除非是修复 bug；若改了，先在 README/DESIGN 记录原因。
+- **不要修改 `com.example.batch` 的编排内核**（`FileBatchPipeline` 等生产者/消费者/合并逻辑），除非是修复 bug；若改了，先在 README/DESIGN 记录原因。像 `RecordReaders` 这类**纯工具/适配器类**是允许的增益——它们不改动引擎，只是给你一段可复用的胶水代码。**唯一被显式批准的、对成批层的受控扩展是"内置分组批处理"（见 §5.4，用 opt-in 的 `BatchingStrategy` 实现，不配置 `groupBy` 时行为完全不变）；除此外不要动 `produce()` 的攒批逻辑。**
 - **业务代码放在新 package**（如 `com.yourcompany.xxx`）或**直接替换 `com.example.demo`** 的示例实现；示例只是演示，不是框架的一部分。
 - **通道 key 用 ASCII**（`paid`/`shipped`），不要用中文状态名——key 会用作分片子目录名，中文目录名在 Windows 打包 / zip 解压 / CI 缓存时易乱码。业务文案放 formatter 里。
 - **注释用中文**，说明"为什么"而非"是什么"；类/方法 javadoc 解释约束（尤其是 SPI 的一一对应、线程安全等）。

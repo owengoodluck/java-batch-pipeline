@@ -10,8 +10,10 @@ target/
 # 系统文件
 .DS_Store
 
-# Demo 运行产物（demo-run/input 与 output 为示例证据，保留）
+# Demo 运行产物：仅保留示例输入，运行生成的 output/group 不入库
 !demo-run/
+demo-run/output/
+demo-run/group/
 
-# 多通道 Demo 产物
+# 多通道 Demo 产物（运行生成，不入库）
 order-demo/

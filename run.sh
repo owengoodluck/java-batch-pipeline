@@ -26,3 +26,10 @@ java -cp "$CP" com.example.demo.DemoOrderMain order-demo 1000
 echo
 echo "==> 产物：order-demo/output/order.{paid,shipped,completed,cancelled,error}"
 echo "==> 分片：order-demo/parts/{通道名}/part-000001.part"
+
+echo
+echo "==> 内置分组示例：按 key 字段分组，每攒满一批同组记录才调一次下游（单组保证）"
+java -cp "$CP" com.example.demo.DemoGroupMain demo-run/group
+
+echo
+echo "==> 产物：demo-run/group/output/group.{success,error}"

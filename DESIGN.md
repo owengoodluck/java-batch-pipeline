@@ -997,3 +997,108 @@ fallback 有独立计数（`ChannelRouter.unregisteredTotal()`）。两者不要
 
 若确实需要，应作为独立设计评审，而不是在现有 SPI 上打补丁。
 
+---
+
+## 15. 内置分组批处理（已实现）
+
+> 状态：**已实现**（代码落地于 `com.example.batch` 的 `BatchingStrategy` 系列 + `PipelineConfig.Builder.groupBy`）。本节为该能力的设计规格与行为约束，与 §14 多通道正交。
+
+### 15.1 动机与取舍
+
+用户的真实诉求："读进来的 100 条不能原样做 Batch Process，要**先按某字段分成多组**，让每次下游调用只含一个组"。
+
+- 现有"批"是**传输层**概念（按 `batchSize` 数量攒批，为并发与背压服务），与"按业务字段分组"是两个正交维度。
+- 先全量读入内存再分组、然后对每组各跑一次流水线的外部方案能实现，但需 O(N) 内存，且打破框架"流式、内存有界"的特性——不适合大数据量。
+- 更贴合诉求的做法是**在流水线内部成批层做分组**：Reader 不变，框架每收到一条输入就按分组字段放进对应 Bucket，Bucket 攒满 `batchSize` 才真正调 `BatchProcessor`。这样每次 `process()` 收到的 batch 天然只含一个组。
+
+### 15.2 设计：策略模式 + opt-in
+
+把"如何成批"从 `produce()` 抽成接口，默认实现字节级等价于现状：
+
+```java
+interface BatchingStrategy<T> {
+    void add(T record) throws IOException;
+    boolean hasReadyBatch();
+    List<T> drainReadyBatch();        // 取一个就绪批次并清空
+    List<List<T>> drainAll();         // EOF 时取出所有未满剩余批次
+}
+```
+
+| 实现 | 行为 | 何时用 |
+|---|---|---|
+| `CountBatchingStrategy<T>` | 单 pending 列表，`size >= batchSize` 才就绪（= 现 `produce()` 逻辑） | 未配置分组（默认） |
+| `GroupBatchingStrategy<T,K>` | 持有 `Map<K, List<T>>` 桶；任一桶满 `batchSize` 即就绪；EOF 取全部剩余桶 | 配置了 `groupBy` |
+
+`PipelineConfig` 新增**可空**字段 `groupExtractor` 与 `Builder.groupBy(GroupKeyExtractor)`。不配置时 `produce()` 用 `CountBatchingStrategy`，行为完全不变；配置后改用 `GroupBatchingStrategy`。`batchSize` 复用为"每桶 flush 阈值"。`build()` 不新增强制校验（error 通道既有校验保留）。
+
+### 15.3 生产者改动（仅替换攒批段）
+
+```java
+BatchingStrategy<T> strat = (groupExtractor == null)
+    ? new CountBatchingStrategy<>(batchSize)
+    : new GroupBatchingStrategy<>(batchSize, groupExtractor);
+while (reader.hasNext()) {
+    strat.add(reader.next());
+    while (strat.hasReadyBatch()) submit(strat.drainReadyBatch());
+}
+for (List<T> b : strat.drainAll()) submit(b);   // EOF 兜底 flush，防丢数据
+```
+
+生产者流程（分组模式）：
+
+```mermaid
+flowchart TB
+    A([生产者启动]) --> B{"aborted? 且 reader.hasNext()?"}
+    B -- 否 --> Z([结束])
+    B -- 是 --> C["rec = reader.next()"]
+    C --> D["strat.add(rec)<br/>按 key 落入 Bucket"]
+    D --> E{"strat.hasReadyBatch()?"}
+    E -- 是 --> F["submit(strat.drainReadyBatch())<br/>单组整批 → BatchProcessor"]
+    F --> E
+    E -- 否 --> B
+    Z --> G{"strat.drainAll()<br/>非空?"}
+    G -- 是 --> H["提交剩余未满 bucket"]
+    G -- 否 --> I([INFO: 生产者结束])
+    H --> I
+```
+
+其余（Semaphore 名额、BatchTask 调用/分流/归还、PartWriter、OutputMerger、PipelineStats）**一行不改**。
+
+### 15.4 行为保证（硬指标）
+
+1. **单组保证**：每次 `BatchProcessor.process()` 收到的 batch 只含同一个 key。
+2. **大组自动切片**：组记录数 > `batchSize` → 拆成多个单组整批，每批仍单组。
+3. **EOF 不丢数据**：未满 bucket 在 reader 耗尽时兜底 flush（否则尾批静默丢失）。
+4. **向后兼容**：未配置 `groupBy` 时与 v1.2 行为完全一致。
+
+`BatchTask` 的 `size == batch.size()` 顺序校验天然成立（每个桶 flush 出的仍是 `List<T>`，顺序保持），落盘/合并逻辑零改动。
+
+### 15.5 基数约束（关键，决定复杂度）
+
+`GroupBatchingStrategy` 为每个不同 key 在内存保留一个 bucket，流式过程中峰值驻留 ≈ `组数 × (batchSize-1)` 条。
+
+| 分组基数 | 可行性 | 措施 |
+|---|---|---|
+| 低基数（≤10，用户场景：按租户/地区/固定业务线） | ✅ 直接做 | 无需桶上限，实现极轻 |
+| 中/高基数（万级~无限，如按用户 ID） | ⚠️ 内存爆炸 | 需加"桶上限 + LRU 淘汰"（未来增强，非当前范围） |
+
+**本设计面向低基数**。中高基数场景应改用**外部分文件预处理**（按 key 落不同文件后各自跑流水线），不要靠本能力——本能力不适合高基数。这与 §14.7"动态分区"不同：动态分区是要把数据拆出成千上万个文件（需分区治理、路径消毒、跨批 key 合并），而本能力是固定的少数几组、每组仍是一次普通批处理。
+
+### 15.6 边界处理（实现时定）
+
+- **key 为 `null`**：归入一个独立 "null bucket"（多占一个桶，低基数下仍安全），文档说明；或由 `build()` 校验拒绝——实现时择一。
+- **抽取抛 `IOException`**：直接上抛，`produce()` 现有异常终止逻辑接管（全局停止）。
+- **`drainReadyBatch` 选择哪个满桶**：低基数下按 `LinkedHashMap` 插入序取首个达标桶即可（O(组数) 扫描，≤10 可忽略）。
+
+### 15.7 参数表（已实现）
+
+| 参数 | 类型 | 默认值 | 必填 | 说明 |
+|---|---|---|---|---|
+| `groupExtractor` | `GroupKeyExtractor<T,K>` | null | | 按字段分组批处理（opt-in）；null = 关闭，走原计数批处理 |
+
+派生影响：`batchSize` 在分组模式下含义变为"每桶 flush 阈值"，全局并发上限 `M = N + B` 不变。
+
+### 15.8 改动范围声明
+
+本次是**有意、受控地扩展内核成批层**：新增 `BatchingStrategy` 接口 + 两个实现，`produce()` 改用策略。它**不是"改坏核心"**，而是该规约下被显式批准的、最小侵入的 opt-in 扩展——不配置 `groupBy` 时零行为变化，所有 SPI 契约不变。实现时须在 §3.2 模块划分与 §4.2 背压中将 core 标记为"需改动（分组模式）"，并在 `agents.md` §10 同步说明。
+

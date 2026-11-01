@@ -131,23 +131,28 @@ public final class FileBatchPipeline<T, P> {
     private void produce() {
         final RecordReader<T> reader = config.getReader();
         final int batchSize = config.getBatchSize();
+        // 攒批策略：不分组时按数量切批（默认），分组时按 key 入桶、满 batchSize 才整桶提交。
+        // 两种策略都复用同一个 submitBatch（含背压与名额归还），其余编排逻辑不动。
+        final BatchingStrategy<T> strat = (config.getGroupExtractor() == null)
+                ? new CountBatchingStrategy<T>(batchSize)
+                : new GroupBatchingStrategy<T>(batchSize, config.getGroupExtractor());
         long seq = 0;
-        List<T> batch = new ArrayList<T>(batchSize);
         try {
             while (!aborted.get() && reader.hasNext()) {
                 T record = reader.next();
                 if (record == null) {
                     continue;
                 }
-                batch.add(record);
+                strat.add(record);
                 stats.addRead(1);
-                if (batch.size() >= batchSize) {
-                    submitBatch(++seq, batch);
-                    batch = new ArrayList<T>(batchSize);
+                while (strat.hasReadyBatch()) {
+                    submitBatch(++seq, strat.drainReadyBatch());
                 }
             }
-            if (!aborted.get() && !batch.isEmpty()) {
-                submitBatch(++seq, batch);   // 尾批：不足 batchSize 的剩余记录
+            if (!aborted.get()) {
+                for (List<T> batch : strat.drainAll()) {
+                    submitBatch(++seq, batch);   // 尾批：各桶未满部分兜底提交，不丢数据
+                }
             }
             PipelineLog.info("生产者结束: 共读取 %d 条，提交 %d 批", stats.getReadCount(), seq);
         } catch (InterruptedException e) {
