@@ -32,21 +32,23 @@ java-batch-pipeline/
 ├── src/main/java/com/example/
 │   ├── batch/                   ← 通用内核（框架本体，不要改，除非修复 bug）
 │   │   ├── RecordReader.java        读取接口（SPI）
-│   │   ├── RecordReaders.java       Iterator / read() 形态适配器
+│   │   ├── RecordReaders.java       Iterator / read() 形态适配器 + 表头表尾组合器
 │   │   ├── BatchProcessor.java      批处理接口（SPI，通常调 HTTP/RPC）
 │   │   ├── RoutingProcessor.java    可选 SPI：按结果分流到不同通道
 │   │   ├── ItemResult.java          单条结果模型
 │   │   ├── RecordFormatter.java     输出行格式（单方法）
-│   │   ├── OutputChannel.java       通道定义（key + 文件 + formatter）
+│   │   ├── OutputChannel.java       通道定义（key + 输出目标 + formatter）
+│   │   ├── ChannelTarget.java       输出目标抽象（SPI）：open() 暂存 / commit() 提交
+│   │   ├── ChannelTargets.java      输出目标工厂：ChannelTargets.file(File)
 │   │   ├── ChannelRouter.java       路由 + 未注册兜底
 │   │   ├── PipelineConfig.java      配置 + Builder（通道表 + 校验 + 可选 groupBy 分组）
-│   │   ├── GroupKeyExtractor.java   分组键提取器（SPI，从记录取分组键，允许抛 IOException）
+│   │   ├── GroupKeyExtractor.java   分组键提取器（SPI，从记录取分组键，不抛受检异常）
 │   │   ├── BatchingStrategy.java    「如何成批」策略接口（默认按数量 / 分组按 key）
 │   │   ├── CountBatchingStrategy.java  默认攒批策略：按到达顺序 + batchSize 切批
-│   │   ├── GroupBatchingStrategy.java  内置分组策略：按 key 入桶，满 batchSize 整桶作单组批次
+│   │   ├── GroupBatchingStrategy.java  内置分组策略：按 key 入桶，攒满即切成 batchSize 大小的单组批次
 │   │   ├── BatchResult.java         运行结果只读快照（run() 的返回值）
-│   │   ├── BatchPipeline.java       一行式入口：BatchPipeline.run(config)
-│   │   ├── FileBatchPipeline.java   内核编排（生产者/背压/合并/停机）
+│   │   ├── BatchPipelines.java      一行式入口：BatchPipelines.run(config)
+│   │   ├── BatchPipeline.java       内核编排（生产者/背压/合并/停机）
 │   │   ├── PartWriter.java / OutputMerger.java / BatchTask.java
 │   │   ├── BatchFailedException.java / PipelineExecutionException.java
 │   │   └── PipelineLog.java / PipelineStats.java
@@ -55,7 +57,7 @@ java-batch-pipeline/
 │       ├── DemoMain.java（双输出）/ DemoOrderMain.java + DemoOrder*（多通道）
 │       ├── DemoGroupRecord.java / DemoGroupReader.java / DemoGroupProcessor.java
 │       │   / DemoGroupFormatter.java / DemoGroupMain.java（内置分组：按 key 字段分组，每满一批同组记录才调下游）
-└── run.sh                       ← 一键 Maven 编译并跑两个 Demo
+└── run.sh                       ← 一键 Maven 编译并跑全部示例
 ```
 
 构建与运行（Maven 已就位）：
@@ -76,13 +78,14 @@ java -cp target/classes com.example.demo.DemoGroupMain      # 跑内置分组 De
 |---|---|
 | 记录 `T` | 一条原始输入（行、订单字符串、对象……）。框架不解读它。 |
 | 处理结果 `ItemResult<P>` | 一条记录被处理后的结果。`success(code, payload)` 或 `failed(code, message)`。`P` 是附加内容类型（如服务端逐条返回的字段）。 |
-| 通道 `OutputChannel` | 一类结果 → 一个目标文件 + 一个行格式。**通道不在业务代码里 new**，由配置声明。 |
-| 路由 | 每条记录被"解析"成一个**已注册**的通道 key，写进对应文件。 |
+| 通道 `OutputChannel` | 一类结果 → 一个输出目标 + 一个行格式。**通道不在业务代码里 new**，由配置声明。 |
+| 输出目标 `ChannelTarget` | 通道结果的最终归宿：落文件、上传对象存储、写标准输出……落本地文件用 `ChannelTargets.file(File)`。 |
+| 路由 | 每条记录被"解析"成一个**已注册**的通道 key，写进对应通道的输出目标。 |
 
 ### 3.1 输出通道的两种声明方式
 
-- **普通业务通道**：`.channel("paid", file, formatter[, createEmpty])` —— key 任意（ASCII），成功记录可路由到这里。
-- **错误通道（兜底安全网）**：`.errorChannel(file, formatter[, createEmpty])` —— key 固定为 `"error"`，由方法内部设定，**调用方不能改名**。
+- **普通业务通道**：`.channel("paid", target, formatter[, createEmpty])` —— key 任意（ASCII），成功记录可路由到这里。
+- **错误通道（兜底安全网）**：`.errorChannel(target, formatter[, createEmpty])` —— key 固定为 `"error"`，由方法内部设定，**调用方不能改名**。
 
 **错误通道是构建期强制项**：`build()` 时若未声明 `.errorChannel(...)`，直接抛 `IllegalArgumentException`。所以任何装配都必须包含它。原因：记录级失败、批次级失败、未注册路由全部落这里；若缺失，第一次失败就会让整条流水线崩溃。
 
@@ -126,6 +129,12 @@ public interface RecordReader<T> extends Closeable {
 - 已有 `Iterator` / `Iterable` / `read()` 形态工具？用 `RecordReaders` 一行适配，原工具类不用改：
   - `RecordReaders.fromIterator(it)` / `fromIterable(iterable)`
   - `RecordReaders.fromReadFunction(exSupplier)`：`exSupplier.get() throws IOException`，返回 `null` 表示结束。
+- **文件带表头/表尾**：不要在 Reader 里手写跳过逻辑，用 `RecordReaders` 的组合器叠加（都是装饰器，`close()` 委派给源）：
+  - `skipping(reader, n)`：丢弃开头 n 条
+  - `filtering(reader, predicate)`：只保留满足条件的记录（如去空行）
+  - `mapping(reader, fn)`：转换形态，`fn` 允许抛 `IOException`
+  - `headerAware(reader, isHeader)`：跳过**开头连续**匹配的表头行
+  - `footerAware(reader, isFooter)`：丢弃**结尾连续**匹配的表尾行（内部预读一条来判定是否到结尾）
 
 ### 4.2 `BatchProcessor<T, P>`（一批怎么处理）
 
@@ -170,13 +179,13 @@ PipelineConfig<String, String> config = PipelineConfig.<String, String>builder()
         .batchSize(100).consumerThreads(4).bufferBatches(1)
         .charset(StandardCharsets.UTF_8)
         // 分片目录默认落系统临时区；想观察 parts/ 结构时再显式 .partsDir(dir)
-        .channel("success", new File(outDir, "sample.success"),
+        .channel("success", ChannelTargets.file(new File(outDir, "sample.success")),
                 (r, res) -> r + "\t" + res.getCode() + "\t" + res.getPayload(), true)
-        .errorChannel(new File(outDir, "sample.error"),
+        .errorChannel(ChannelTargets.file(new File(outDir, "sample.error")),
                 (r, res) -> res.getCode() + "\t" + res.getMessage() + "\t" + r, true)
         .build();
 
-BatchResult result = BatchPipeline.run(config);   // 一行式入口
+BatchResult result = BatchPipelines.run(config);  // 一行式入口
 System.out.println(result);                        // 读取数 / 成功失败 / 通道分布 / 耗时
 ```
 
@@ -186,11 +195,11 @@ System.out.println(result);                        // 读取数 / 成功失败 /
 PipelineConfig<String, String> config = PipelineConfig.<String, String>builder()
         .reader(reader)
         .processor(new MyOrderProcessor())         // 同时 implements RoutingProcessor
-        .channel("paid",      new File(dir, "order.paid"),      okFmt)
-        .channel("shipped",   new File(dir, "order.shipped"),   okFmt)
-        .channel("completed", new File(dir, "order.completed"), okFmt)
-        .channel("cancelled", new File(dir, "order.cancelled"), okFmt)
-        .errorChannel(new File(dir, "order.error"), errFmt)     // 兜底，必须
+        .channel("paid",      ChannelTargets.file(new File(dir, "order.paid")),      okFmt)
+        .channel("shipped",   ChannelTargets.file(new File(dir, "order.shipped")),   okFmt)
+        .channel("completed", ChannelTargets.file(new File(dir, "order.completed")), okFmt)
+        .channel("cancelled", ChannelTargets.file(new File(dir, "order.cancelled")), okFmt)
+        .errorChannel(ChannelTargets.file(new File(dir, "order.error")), errFmt)  // 兜底，必须
         .build();
 ```
 
@@ -207,7 +216,7 @@ public String channelOf(int indexInBatch, String record, ItemResult<String> resu
 
 ### 5.3 需要中途 abort / 读运行态时
 
-改用实例形态：`new FileBatchPipeline<>(config).run()`，拿到引用后可调 `run()` / `abort(...)` / `getStats()`。
+改用实例形态：`new BatchPipeline<>(config).run()`，拿到引用后可调 `run()` / `abort(...)` / `getStats()`。
 
 ### 5.4 批量前按字段分组（内置分组，单组保证）
 
@@ -220,24 +229,40 @@ public String channelOf(int indexInBatch, String record, ItemResult<String> resu
 ```java
 PipelineConfig.<MyRec, String>builder()
     .reader(reader).processor(processor)
-    .groupBy(r -> r.getGroupKey())          // ← 内置分组：按字段取分组键（允许抛 IOException）
+    .groupBy(r -> r.getGroupKey())          // ← 内置分组：按字段取分组键（纯取值，不抛受检异常）
     .batchSize(50)                          // 作为“每桶 flush 阈值”
     .channel("success", ...).errorChannel(...)
     .build();
 ```
 
-`groupBy` 接收一个 `GroupKeyExtractor<T, K>`（函数式接口，`K extract(T) throws IOException`）。底层把"如何成批"抽成 `BatchingStrategy<T>` 策略：默认 `CountBatchingStrategy`（按数量切批，字节级等价于旧版），配置分组时用 `GroupBatchingStrategy`（按 key 分桶、满 `batchSize` flush、EOF 兜底 flush）。不配置 `groupBy` 时走默认策略，老行为完全不变。
+`groupBy` 接收一个 `GroupKeyExtractor<T, K>`（函数式接口，`K extract(T)`，不抛受检异常）。底层把"如何成批"抽成 `BatchingStrategy<T>` 策略：默认 `CountBatchingStrategy`（按数量切批），配置分组时用 `GroupBatchingStrategy`（按 key 分桶、攒满即切成 `batchSize` 大小的批次、EOF 兜底 flush）。不配置 `groupBy` 时框架按数量攒批，与配置分组时走同一套策略契约。
 
 **关键事实（务必理解）**：
 
 - **单组保证**：每次下游调用只含同一个分组键。整组超过 `batchSize` 会被切成多个"单组批次"，每个仍是单组；输入结束时各桶未满的尾批会兜底提交，**不丢数据**。
-- **内存有界**：任意时刻驻留 ≤ 组数 × (batchSize−1)，与输入总量 N 无关——**不需要把全部记录读进内存**。这正是它优于"先全量读入再分组"的根本原因（后者 O(N) 内存，数据量大即 OOM）。
+- **内存有界**：各桶合计 ≤ 组数 × (batchSize−1)，另加在途批次 (N+B) × batchSize，两项都与输入总量 N 无关——**不需要把全部记录读进内存**。这正是它优于"先全量读入再分组"的根本原因（后者 O(N) 内存，数据量大即 OOM）。
 - **硬约束：分组键的不同值数量必须有界且较小（低基数）**，典型如租户/地区/渠道（几十到几百）。高基数（如按用户 ID）会撑爆内存，应改用**外部分文件预处理**（按 key 落不同文件后各自跑流水线），不要靠本能力。
-- **未配置 `groupBy` 时**：行为与旧版本完全一致（向后兼容）。
+- **未配置 `groupBy` 时**：框架按数量攒批（默认 `CountBatchingStrategy`），其余 SPI 契约不变。
 
 **与「processor 内分组」的边界**：只想"同批里同组的记录一起发"，可在 `BatchProcessor` 内对框架按数量给的一批做 `groupBy` 再分别调下游——更省事，但分组只在当前这批内有效，组跨 batch 边界会被拆成两次调用。需要"**严格单组保证 + 内存有界**"时才用上面的内置 `groupBy`。
 
 完整可运行示例见 `com.example.demo.DemoGroupMain`（输入 G1/G2/G3 交错，按 `key` 内置分组，输出 `output/group.success` 与 `group.error`；processor 会断言每批单组并打印组号）。
+
+### 5.5 输出目标：不止本地文件
+
+通道的**最终归宿**由 `ChannelTarget` 描述：
+
+```java
+public interface ChannelTarget {
+    OutputStream open()   throws IOException;   // 打开暂存流，框架写入合并后的全部内容
+    void         commit() throws IOException;   // 流关闭后调用，此时结果才对外可见
+}
+```
+
+- 落本地文件：`.channel("success", ChannelTargets.file(new File(dir, "order.success")), fmt, true)`
+- 落到 S3/OSS：实现 `ChannelTarget`（`open()` 返回本地临时文件流，`commit()` 上传后删除）——**框架不引入任何 SDK**。
+
+**关键点：分片目录（`.partsDir(...)`）始终在本地**，它是并行阶段的暂存区，与输出目标解耦。好处是远程写入失败可重试 `commit()`，不必重跑整条流水线。
 
 ---
 
@@ -251,7 +276,8 @@ PipelineConfig.<MyRec, String>builder()
 | `awaitTerminationSeconds` | 60 | 停机时等待在途批次的上限，超时强制 `shutdownNow()` |
 | `charset` | UTF-8 | 读写编码 |
 | `deletePartsOnSuccess` | true | 合并成功后清理分片目录 |
-| `partsDir` | 系统临时目录 | 分片目录（想观察 `parts/` 结构时显式指定） |
+| `partsDir` | 系统临时目录 | 分片目录（本地暂存区，与输出目标解耦） |
+| `groupExtractor` | null | 批量前按字段分组（opt-in，见 §5.4）；null = 按 `batchSize` 数量攒批 |
 
 `PipelineConfig.maxInflightBatches()` = `consumerThreads + bufferBatches`。批处理通常远慢于"读 100 行文本"，`B=1` 基本就能消除消费者空等；`consumerThreads` 取决于后端并发承受能力。
 
@@ -279,7 +305,7 @@ PipelineConfig.<MyRec, String>builder()
 - 生产者单线程读、攒批；消费者多线程并发 `process`。
 - 背压 = 信号量控制在途批次数 M = N + B。生产者**先攒满一批再申请名额**（不是先占名额再读），因此无闲置空间时生产者停在 `acquire()` 上，不再读取、不再提交——严格符合"没空间就停产"。
 - 内存上界 = (N + B) × batchSize 条记录，与文件大小无关。
-- 并行阶段每个批次只写自己的分片（`parts/{key}/part-00000N.part`），零锁竞争；全部结束后单线程按批次序号升序合并，先写 `*.tmp` 再 `rename`，下游永远读不到写了一半的文件。
+- 并行阶段每个批次只写自己的分片（`parts/{key}/part-00000N.part`），零锁竞争；全部结束后单线程按批次序号升序合并，交给该通道的 `ChannelTarget` 提交——文件目标即"写同目录 `.tmp` → 原子 rename"，下游永远读不到写了一半的输出。
 - 因批次序号连续、文件名零填充，**每个通道内部天然保持原始行序**。
 
 ---
@@ -290,12 +316,12 @@ PipelineConfig.<MyRec, String>builder()
 
 1. **明确输入来源** → 选/写 `RecordReader`（或 `RecordReaders` 适配器）。把"一条原始记录"抽象成 `T`。
 2. **明确"一批怎么处理"** → 写 `BatchProcessor`：真实调用接口/数据库，返回与 batch 一一对应的 `ItemResult` 列表；整批失败抛 `BatchFailedException`。
-3. **明确出口文件** → 设计通道表：只需成功/错误两个？还是要按状态拆多个？错误通道必须声明。
+3. **明确出口** → 设计通道表：只需成功/错误两个？还是要按状态拆多个？错误通道必须声明。默认落本地文件用 `ChannelTargets.file(...)`；要落到 S3/OSS 等则实现 `ChannelTarget`（见 §5.5）。
 4. **写 `RecordFormatter`**：普通通道读 `payload`，错误通道读 `code/message`；列顺序要稳定（下游按列解析）。
 5. **若多通道** → 处理器实现 `RoutingProcessor.channelOf`（只处理成功记录，返回已声明 key，线程安全）。
 6. **装配 `PipelineConfig`**：`reader` / `processor` / `channel(...)*` / `errorChannel(...)` / 参数；调 `build()`（缺 error 通道会立即报错，这是预期的安全网）。
-7. **运行**：`BatchPipeline.run(config)`；用 `try/catch` 兜 `PipelineExecutionException`。
-8. **验证守恒**：`Σ通道行数 == 输入条数`；批次失败时该批整批进 error；`mvn compile` 应保持零警告。
+7. **运行**：`BatchPipelines.run(config)`；用 `try/catch` 兜 `PipelineExecutionException`。
+8. **验证守恒**：`Σ通道行数 == 输入条数`；批次失败时该批整批进 error；`mvn test` 保持全绿、`mvn compile` 零警告。
 
 ---
 
@@ -303,12 +329,12 @@ PipelineConfig.<MyRec, String>builder()
 
 - **仅 Java 8 语法**；内核零第三方运行时依赖（真实业务所需的 HTTP/DB 驱动由使用方自行引入）。
 - **构建**：用 Maven（`mvn compile`），不要手写 javac 命令或维护 `out/` 目录。
-- **不要修改 `com.example.batch` 的编排内核**（`FileBatchPipeline` 等生产者/消费者/合并逻辑），除非是修复 bug；若改了，先在 README/DESIGN 记录原因。像 `RecordReaders` 这类**纯工具/适配器类**是允许的增益——它们不改动引擎，只是给你一段可复用的胶水代码。**唯一被显式批准的、对成批层的受控扩展是"内置分组批处理"（见 §5.4，用 opt-in 的 `BatchingStrategy` 实现，不配置 `groupBy` 时行为完全不变）；除此外不要动 `produce()` 的攒批逻辑。**
+- **不要修改 `com.example.batch` 的编排内核**（`BatchPipeline` 等生产者/消费者/合并逻辑），除非是修复 bug；若改了，先在 README/DESIGN 记录原因。像 `RecordReaders` 这类**纯工具/适配器类**是允许的增益——它们不改动引擎，只是给你一段可复用的胶水代码。**唯一被显式批准的、对成批层的受控扩展是"内置分组批处理"（见 §5.4，用 opt-in 的 `BatchingStrategy` 实现，不配置 `groupBy` 时行为完全不变）；除此外不要动 `produce()` 的攒批逻辑。**
 - **业务代码放在新 package**（如 `com.yourcompany.xxx`）或**直接替换 `com.example.demo`** 的示例实现；示例只是演示，不是框架的一部分。
 - **通道 key 用 ASCII**（`paid`/`shipped`），不要用中文状态名——key 会用作分片子目录名，中文目录名在 Windows 打包 / zip 解压 / CI 缓存时易乱码。业务文案放 formatter 里。
 - **注释用中文**，说明"为什么"而非"是什么"；类/方法 javadoc 解释约束（尤其是 SPI 的一一对应、线程安全等）。
-- **编译质量门禁**：`mvn compile` 应保持 `-Xlint:all` 零警告（pom 已配置）。
-- **git 协作约定（来自本仓库历史）**：非经用户明确要求，不要 `push` 到 `origin/main`（当前 main 与 origin/main 存在分歧，若需推送须用 `git push --force-with-lease origin main`，务必先与用户确认）。提交信息用中文、聚焦单一意图。
+- **编译与测试门禁**：`mvn compile` 应保持 `-Xlint:all` 零警告（pom 已配置）；改动内核或 SPI 后必须 `mvn test` 全绿。
+- **git 协作约定**：非经用户明确要求，不要 `push` 到 `origin/main`（当前 main 与 origin/main 存在分歧，若需推送须用 `git push --force-with-lease origin main`，务必先与用户确认）。提交信息用中文、聚焦单一意图。
 
 ---
 
@@ -321,13 +347,13 @@ PipelineConfig.<MyRec, String>builder()
 - ❌ 通道 key 拼写/空格与 `channel(...)` 声明不一致 → 静默兜底到 error（排查时看 `BatchResult.getChannelCounts()` 与告警日志）。
 - ❌ 成功记录被 `channelOf` 指到 `"error"` → 自动拨回 `success` 并告警；错误通道只收失败行。
 - ❌ 把 `RecordReader` / `BatchProcessor` / `channelOf` 写成有状态的、非线程安全的 → 多消费者并发会出错。
-- ⚠️ 错误文件里的行由同一个 formatter 渲染，格式为 `错误码 \t 错误信息 \t 原始记录`；不要为错误通道单独搞一套"多一列级别"的格式——早期版本有过，已移除。
+- ⚠️ 一个通道只用一个 formatter 渲染（成功通道只收成功行、错误通道只收失败行）。**同一通道内列数必须稳定**，否则下游按列解析会错位；Demo 的错误行是 `错误码 \t 错误信息 \t 原始记录`，不要为它单独加"级别"列。
 
 ---
 
 ## 12. 验证清单（交付前自检）
 
-- [ ] `mvn clean compile` 零警告、零错误。
+- [ ] `mvn clean test` 全绿（当前 27 个用例），`mvn compile` 零警告、零错误。
 - [ ] 双输出：`success 行数 + error 行数 == 输入行数`。
 - [ ] 多通道：`Σ各通道行数 == 输入条数`（看 `BatchResult.getChannelCounts()`）。
 - [ ] 批次级失败时该批整批进 error（错误码为 `BATCH_*` 前缀）。

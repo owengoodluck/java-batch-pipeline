@@ -1,7 +1,10 @@
 package com.example.batch;
 
 import java.io.File;
+import java.io.IOException;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -9,15 +12,15 @@ import java.util.Map;
 /**
  * 流水线配置（Builder 装配）。业务相关的能力全部由 SPI 注入，配置本身不含业务逻辑。
  *
- * <p>输出侧是一张<b>通道表</b>：每个通道 = 一个目标文件 + 一套行格式（{@link RecordFormatter}）。
- * 通道在 build() 时全部声明完毕，运行时只允许路由到已声明的 key：
+ * <p>输出侧是一张<b>通道表</b>：每个通道 = 一个输出目标（{@link ChannelTarget}）+ 一套行格式
+ * （{@link RecordFormatter}）。通道在 build() 时全部声明完毕，运行时只允许路由到已声明的 key：
  * <pre>
  * PipelineConfig.&lt;String, String&gt;builder()
  *     .reader(reader)
  *     .processor(processor)
- *     .channel("success", new File(dir, "order.success"), successFormatter)  // 成功记录落这里
- *     .channel("paid",    new File(dir, "order.paid"),    paidFormatter)    // 额外分流通道
- *     .errorChannel(new File(dir, "order.error"), errFormatter)             // 兜底：失败记录落这里
+ *     .channel("success", ChannelTargets.file(new File(dir, "order.success")), successFormatter)
+ *     .channel("paid",    ChannelTargets.file(new File(dir, "order.paid")),    paidFormatter)
+ *     .errorChannel(ChannelTargets.file(new File(dir, "order.error")), errFormatter)
  *     .build();
  * </pre>
  *
@@ -53,12 +56,11 @@ public final class PipelineConfig<T, P> {
 
     /** 声明顺序即合并顺序，保证多次运行输出文件的生成次序稳定。 */
     private final Map<String, OutputChannel<T, P>> channels;
-    private final String errorChannelKey;
 
     /** 分组键提取器（可选）。为 null 时按数量攒批（默认策略）；非 null 时启用内置分组。 */
     private final GroupKeyExtractor<T, ?> groupExtractor;
 
-    private PipelineConfig(Builder<T, P> b, Map<String, OutputChannel<T, P>> channels, String errorChannelKey) {
+    private PipelineConfig(Builder<T, P> b, Map<String, OutputChannel<T, P>> channels) {
         this.reader = b.reader;
         this.processor = b.processor;
         this.batchSize = b.batchSize;
@@ -69,7 +71,6 @@ public final class PipelineConfig<T, P> {
         this.deletePartsOnSuccess = b.deletePartsOnSuccess;
         this.partsDir = b.partsDir;
         this.channels = Collections.unmodifiableMap(channels);
-        this.errorChannelKey = errorChannelKey;
         this.groupExtractor = b.groupExtractor;
     }
 
@@ -127,11 +128,6 @@ public final class PipelineConfig<T, P> {
         return channels.get(key);
     }
 
-    /** 错误通道的 key（固定为 {@link OutputChannel#ERROR}）。 */
-    public String getErrorChannelKey() {
-        return errorChannelKey;
-    }
-
     /**
      * 分组键提取器；null 表示不分组（走默认按数量攒批策略）。
      * 非 null 时启用内置分组批处理：每条记录先按键入桶，某桶攒满 batchSize 即作为一个单组批次提交。
@@ -149,7 +145,7 @@ public final class PipelineConfig<T, P> {
         private int consumerThreads = 2;
         private int bufferBatches = 1;
         private long awaitTerminationSeconds = 60L;
-        private Charset charset = Charset.forName("UTF-8");
+        private Charset charset = StandardCharsets.UTF_8;
         private boolean deletePartsOnSuccess = true;
 
         private File partsDir;
@@ -171,13 +167,14 @@ public final class PipelineConfig<T, P> {
         }
 
         /** 声明一个输出通道：成功或失败结果都交给同一个 {@link RecordFormatter} 渲染。 */
-        public Builder<T, P> channel(String key, File target, RecordFormatter<T, P> formatter) {
+        public Builder<T, P> channel(String key, ChannelTarget target,
+                                     RecordFormatter<T, P> formatter) {
             return channel(key, target, formatter, false);
         }
 
-        /** 声明一个输出通道，并指定无数据时是否仍生成空文件。 */
-        public Builder<T, P> channel(String key, File target, RecordFormatter<T, P> formatter,
-                                     boolean createEmpty) {
+        /** 声明一个输出通道，并指定无数据时是否仍产出空结果。 */
+        public Builder<T, P> channel(String key, ChannelTarget target,
+                                     RecordFormatter<T, P> formatter, boolean createEmpty) {
             return add(OutputChannel.of(key, target, formatter, createEmpty));
         }
 
@@ -188,12 +185,12 @@ public final class PipelineConfig<T, P> {
          * 调用方无需也不能改成别的名字——失败的路由目标在引擎里写死为这个 key。
          * 它是整条流水线的兜底：缺失会在 {@link #build()} 时报错，避免“首次失败才崩溃”。
          */
-        public Builder<T, P> errorChannel(File target, RecordFormatter<T, P> formatter) {
+        public Builder<T, P> errorChannel(ChannelTarget target, RecordFormatter<T, P> formatter) {
             return errorChannel(target, formatter, false);
         }
 
-        /** 声明错误通道，并指定无失败时是否仍生成空文件。 */
-        public Builder<T, P> errorChannel(File target, RecordFormatter<T, P> formatter,
+        /** 声明错误通道，并指定无失败时是否仍产出空结果。 */
+        public Builder<T, P> errorChannel(ChannelTarget target, RecordFormatter<T, P> formatter,
                                           boolean createEmpty) {
             return add(OutputChannel.of(OutputChannel.ERROR, target, formatter, createEmpty));
         }
@@ -251,7 +248,8 @@ public final class PipelineConfig<T, P> {
          * <p><b>硬约束</b>：分组键的<b>不同值数量必须有界且较小（低基数）</b>——如租户 / 地区 / 渠道。
          * 高基数（如用户 ID）会撑爆内存，不适用本能力（需要的话应改用外部分文件预处理）。
          *
-         * <p>不调用本方法（默认 null）时，行为等价于「按数量切批」，与旧版本完全一致。
+         * <p>不调用本方法（默认 null）时，框架使用 {@link CountBatchingStrategy} 按数量攒批：
+         * 记录按到达顺序达到 batchSize 即提交一批。
          */
         public <K> Builder<T, P> groupBy(GroupKeyExtractor<T, K> extractor) {
             this.groupExtractor = extractor;
@@ -278,8 +276,8 @@ public final class PipelineConfig<T, P> {
             // 分片目录默认落到系统临时区；想观察 parts/ 结构时再显式指定。
             if (partsDir == null) {
                 try {
-                    partsDir = java.nio.file.Files.createTempDirectory("batch-pipeline").toFile();
-                } catch (java.io.IOException e) {
+                    partsDir = Files.createTempDirectory("batch-pipeline").toFile();
+                } catch (IOException e) {
                     throw new IllegalStateException(
                             "无法创建默认分片目录，请用 partsDir(...) 显式指定", e);
                 }
@@ -289,11 +287,11 @@ public final class PipelineConfig<T, P> {
                     new LinkedHashMap<String, OutputChannel<T, P>>(channels);
             if (!resolved.containsKey(OutputChannel.ERROR)) {
                 throw new IllegalArgumentException(
-                        "必须声明错误通道（兜底安全网）：调用 errorChannel(file, formatter)。"
+                        "必须声明错误通道（兜底安全网）：调用 errorChannel(target, formatter)。"
                                 + "记录级失败、批次级失败与未注册路由都落这里，"
                                 + "缺失会导致首次失败时整条流水线中止。");
             }
-            return new PipelineConfig<T, P>(this, resolved, OutputChannel.ERROR);
+            return new PipelineConfig<T, P>(this, resolved);
         }
     }
 }

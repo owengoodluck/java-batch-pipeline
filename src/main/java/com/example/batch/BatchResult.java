@@ -3,7 +3,11 @@ package com.example.batch;
 import java.util.Map;
 
 /**
- * 一次流水线运行的只读结果快照（{@link FileBatchPipeline#run} 的返回值）。
+ * 一次流水线运行的只读结果快照（{@link BatchPipeline#run()} 正常结束时返回）。
+ *
+ * <p>中止（读取失败 / 写分片失败 / 外部 abort）时 {@code run()} 直接抛
+ * {@link PipelineExecutionException} 并携带原因，因此这里不存在"中止状态"字段——
+ * 拿到本对象就代表这次运行完整跑到了收尾阶段。
  *
  * <p>守恒式：{@code readCount == recordSuccess + recordFailed + recordBatchFailed}。
  * 各通道写入行数合计在「严格分流」场景下也应等于 {@code readCount}。
@@ -20,13 +24,11 @@ public final class BatchResult {
     private final Map<String, Long> channelCounts;
     private final Map<String, Long> codeCounts;
     private final long elapsedMillis;
-    private final boolean aborted;
-    private final Throwable abortCause;
 
     BatchResult(long readCount, long batchSubmitted, long batchOk, long batchFailed,
                 long recordSuccess, long recordFailed, long recordBatchFailed,
                 Map<String, Long> channelCounts, Map<String, Long> codeCounts,
-                long elapsedMillis, boolean aborted, Throwable abortCause) {
+                long elapsedMillis) {
         this.readCount = readCount;
         this.batchSubmitted = batchSubmitted;
         this.batchOk = batchOk;
@@ -37,8 +39,6 @@ public final class BatchResult {
         this.channelCounts = channelCounts;
         this.codeCounts = codeCounts;
         this.elapsedMillis = elapsedMillis;
-        this.aborted = aborted;
-        this.abortCause = abortCause;
     }
 
     public long getReadCount() {
@@ -88,20 +88,10 @@ public final class BatchResult {
         return elapsedMillis;
     }
 
-    /** true 表示运行被提前停止（读取失败、写分片失败、外部 abort 等）。 */
-    public boolean isAborted() {
-        return aborted;
-    }
-
-    public Throwable getAbortCause() {
-        return abortCause;
-    }
-
     @Override
     public String toString() {
         return "BatchResult{read=" + readCount + ", ok=" + recordSuccess
                 + ", failed=" + getRecordFailedTotal() + ", batches=" + batchSubmitted
-                + ", channels=" + channelCounts + ", elapsed=" + elapsedMillis + "ms"
-                + (aborted ? ", ABORTED: " + abortCause : "") + "}";
+                + ", channels=" + channelCounts + ", elapsed=" + elapsedMillis + "ms}";
     }
 }

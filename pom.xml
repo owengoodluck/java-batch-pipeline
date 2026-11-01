@@ -25,6 +25,12 @@
 
     <dependencies>
         <!-- 本框架零第三方运行时依赖；真实业务所需的 HTTP/DB 驱动由使用方自行引入 -->
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <version>4.13.2</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>

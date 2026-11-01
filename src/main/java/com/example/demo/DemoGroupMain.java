@@ -1,7 +1,8 @@
 package com.example.demo;
 
-import com.example.batch.BatchPipeline;
+import com.example.batch.BatchPipelines;
 import com.example.batch.BatchResult;
+import com.example.batch.ChannelTargets;
 import com.example.batch.PipelineConfig;
 
 import java.io.BufferedWriter;
@@ -10,6 +11,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 
 /**
  * 可运行 Demo：演示「批量前按字段分组」的<b>内置分组批处理</b>（最新设计，无需外部全量读入）。
@@ -23,7 +25,7 @@ import java.nio.charset.Charset;
  */
 public class DemoGroupMain {
 
-    private static final Charset CS = Charset.forName("UTF-8");
+    private static final Charset CS = StandardCharsets.UTF_8;
     private static final int TOTAL_LINES = 120;          // 3 组 × 40 条
     private static final int BATCH_SIZE = 10;            // 每组 40 条 → 每组切成 4 个「单组批次」
     private static final String[] GROUPS = {"G1", "G2", "G3"};
@@ -37,7 +39,7 @@ public class DemoGroupMain {
         generateInputIfAbsent(input, TOTAL_LINES);
 
         // 一条流水线 + 内置分组：按 key 字段分组，每攒满 BATCH_SIZE 个同组记录才真正调一次下游。
-        BatchResult result = BatchPipeline.run(
+        BatchResult result = BatchPipelines.run(
                 PipelineConfig.<DemoGroupRecord, String>builder()
                         .reader(new DemoGroupReader(input, CS))
                         .processor(new DemoGroupProcessor())
@@ -47,9 +49,9 @@ public class DemoGroupMain {
                         .bufferBatches(2)
                         .charset(CS)
                         .partsDir(partsDir)
-                        .channel("success", new File(outDir, "group.success"),
+                        .channel("success", ChannelTargets.file(new File(outDir, "group.success")),
                                 DemoGroupFormatter.SUCCESS, true)
-                        .errorChannel(new File(outDir, "group.error"),
+                        .errorChannel(ChannelTargets.file(new File(outDir, "group.error")),
                                 DemoGroupFormatter.ERROR, true)
                         .build());
 

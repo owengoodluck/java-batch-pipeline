@@ -1,7 +1,8 @@
 package com.example.demo;
 
-import com.example.batch.BatchPipeline;
+import com.example.batch.BatchPipelines;
 import com.example.batch.BatchResult;
+import com.example.batch.ChannelTargets;
 import com.example.batch.PipelineConfig;
 import com.example.batch.PipelineLog;
 
@@ -14,6 +15,8 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 
 /**
  * 多通道分流示例：1000 条订单按查询到的状态写进 4 个业务文件 + 1 个错误文件。
@@ -36,7 +39,7 @@ import java.nio.charset.Charset;
  */
 public class DemoOrderMain {
 
-    private static final Charset UTF8 = Charset.forName("UTF-8");
+    private static final Charset UTF8 = StandardCharsets.UTF_8;
 
     private static final String[] OUTPUT_FILES = {
             "order.paid", "order.shipped", "order.completed", "order.cancelled", "order.error"
@@ -61,15 +64,20 @@ public class DemoOrderMain {
                 // Demo 保留分片目录，便于观察"每个通道一个子目录"的物理结构
                 .deletePartsOnSuccess(false)
                 // 普通通道只收成功记录：一个 lambda 就是一个通道的格式
-                .channel("paid", new File(outDir, "order.paid"), DemoLineFormatter.SUCCESS_TSV)
-                .channel("shipped", new File(outDir, "order.shipped"), DemoLineFormatter.SUCCESS_TSV)
-                .channel("completed", new File(outDir, "order.completed"), DemoLineFormatter.SUCCESS_TSV)
-                .channel("cancelled", new File(outDir, "order.cancelled"), DemoLineFormatter.SUCCESS_TSV)
+                .channel("paid", ChannelTargets.file(new File(outDir, "order.paid")),
+                        DemoLineFormatter.SUCCESS_TSV)
+                .channel("shipped", ChannelTargets.file(new File(outDir, "order.shipped")),
+                        DemoLineFormatter.SUCCESS_TSV)
+                .channel("completed", ChannelTargets.file(new File(outDir, "order.completed")),
+                        DemoLineFormatter.SUCCESS_TSV)
+                .channel("cancelled", ChannelTargets.file(new File(outDir, "order.cancelled")),
+                        DemoLineFormatter.SUCCESS_TSV)
                 // 错误通道（兜底）：查询失败与未注册状态兜底都落这里
-                .errorChannel(new File(outDir, "order.error"), DemoLineFormatter.ERROR_TSV)
+                .errorChannel(ChannelTargets.file(new File(outDir, "order.error")),
+                        DemoLineFormatter.ERROR_TSV)
                 .build();
 
-        BatchResult result = BatchPipeline.run(config);
+        BatchResult result = BatchPipelines.run(config);
         PipelineLog.info("运行结果: %s", result);
 
         report(workDir, total);
@@ -115,7 +123,7 @@ public class DemoOrderMain {
             PipelineLog.info("（已清理）");
             return;
         }
-        java.util.Arrays.sort(channelDirs);
+        Arrays.sort(channelDirs);
         for (File dir : channelDirs) {
             if (!dir.isDirectory()) {
                 continue;

@@ -85,20 +85,20 @@ public final class PartWriter<T, P> {
         return counts;
     }
 
-    /** 整批调用失败：全部记录以失败结果写入错误通道的分片（统一走 format）。 */
+    /**
+     * 整批调用失败：全部记录以失败结果写入错误通道的分片（统一走 format）。
+     *
+     * <p>错误通道由 {@link PipelineConfig.Builder#build()} 强制校验存在，这里不再做空判断。
+     */
     public int writeBatchFailed(long batchSeq, List<T> batch, String errorCode, String message)
             throws IOException {
-        OutputChannel<T, P> errorChannel = config.getChannel(config.getErrorChannelKey());
-        if (errorChannel == null) {
-            throw new IOException("通道路由失败：未声明错误通道（key=" + config.getErrorChannelKey() + "）");
-        }
+        OutputChannel<T, P> errorChannel = config.getChannel(OutputChannel.ERROR);
         File part = partFile(errorChannel.getKey(), batchSeq);
         BufferedWriter writer = openWriter(part);
         int n = 0;
         try {
             for (T record : batch) {
-                writeLine(writer, errorChannel.getFormatter()
-                        .format(record, ItemResult.<P>failed(errorCode, message)));
+                writeLine(writer, formatFailure(errorChannel, record, errorCode, message));
                 n++;
             }
         } finally {
@@ -108,21 +108,25 @@ public final class PartWriter<T, P> {
     }
 
     /**
-     * 选择行格式。
+     * 渲染一行。
      *
      * <p>兜底记录（请求了未注册通道）即便业务上是成功的，也必须走**错误格式**：
      * 否则错误文件里会混入列数不同的行，下游按列解析直接错位。
      */
     private String formatLine(OutputChannel<T, P> channel, T record, ItemResult<P> result,
-                              ChannelRouter.Route route) throws IOException {
-        // 兜底记录（请求了未注册通道）即便业务上是成功的，也必须渲染成失败结果：
-        // 否则错误文件里会混入列数不同的行，下游按列解析直接错位。
-        ItemResult<P> effective = route.isFallback()
-                ? ItemResult.<P>failed("UNROUTED:" + route.getRequestedKey(),
-                        "通道 " + route.getRequestedKey() + " 未注册（原始结果码 "
-                                + result.getCode() + "）")
-                : result;
-        return channel.getFormatter().format(record, effective);
+                              ChannelRouter.Route route) {
+        if (route.isFallback()) {
+            return formatFailure(channel, record,
+                    "UNROUTED:" + route.getRequestedKey(),
+                    "通道 " + route.getRequestedKey() + " 未注册（原始结果码 "
+                            + result.getCode() + "）");
+        }
+        return channel.getFormatter().format(record, result);
+    }
+
+    /** 失败行的唯一出口：先合成失败结果，再交给通道自己的 formatter 渲染。 */
+    private String formatFailure(OutputChannel<T, P> channel, T record, String errorCode, String message) {
+        return channel.getFormatter().format(record, ItemResult.<P>failed(errorCode, message));
     }
 
     private File partFile(String channelKey, long batchSeq) throws IOException {

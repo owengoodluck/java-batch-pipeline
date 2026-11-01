@@ -16,7 +16,8 @@ public interface BatchProcessor<T, P> {
      * @param batch    一批记录（最后一批可能不足 batchSize）
      * @param batchSeq 批次序号（从 1 开始，与文件中的位置顺序一致）
      * @return 与入参 batch 一一对应、顺序一致的结果列表
-     * @throws BatchFailedException 整批调用失败时抛出，该批全部记录会标记为 BATCH 级错误
+     * @throws BatchFailedException 整批调用失败时抛出，该批全部记录写入错误通道，
+     *                              错误码取自本异常（建议 {@code BATCH_*} 前缀）
      */
     List<ItemResult<P>> process(List<T> batch, long batchSeq) throws BatchFailedException;
 }

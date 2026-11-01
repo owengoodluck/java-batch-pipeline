@@ -1,6 +1,5 @@
 package com.example.demo;
 
-import com.example.batch.ItemResult;
 import com.example.batch.RecordFormatter;
 
 /**

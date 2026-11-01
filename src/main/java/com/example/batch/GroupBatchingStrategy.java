@@ -1,7 +1,7 @@
 package com.example.batch;
 
-import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -39,7 +39,7 @@ public final class GroupBatchingStrategy<T> implements BatchingStrategy<T> {
         this.extractor = Objects.requireNonNull(extractor, "groupExtractor");
     }
 
-    public void add(T record) throws IOException {
+    public void add(T record) {
         Object key = extractor.extract(record);
         List<T> bucket = buckets.get(key);
         if (bucket == null) {
@@ -49,35 +49,34 @@ public final class GroupBatchingStrategy<T> implements BatchingStrategy<T> {
         bucket.add(record);
     }
 
-    public boolean hasReadyBatch() {
-        for (List<T> bucket : buckets.values()) {
-            if (bucket.size() >= batchSize) {
-                return true;
+    /**
+     * 一次遍历把所有攒满的桶取出。用迭代器的 {@code remove()} 在遍历中改 map，
+     * 既避免 ConcurrentModificationException，也不会像「先找 key 再 remove」那样
+     * 需要额外区分「没找到」与「key 恰好是 null」。
+     *
+     * <p>取出的每个批次长度<b>恰好是 batchSize</b>：即便调用方攒了很多条才来取，
+     * 一个桶也会被切成多个「单组批次」，不会交出一个超长的批次——
+     * 下游按 batchSize 设计的容量契约因此不依赖调用方的取批节奏。
+     */
+    public List<List<T>> drainReadyBatches() {
+        List<List<T>> ready = new ArrayList<List<T>>();
+        Iterator<Map.Entry<Object, List<T>>> it = buckets.entrySet().iterator();
+        while (it.hasNext()) {
+            List<T> bucket = it.next().getValue();
+            while (bucket.size() >= batchSize) {
+                List<T> batch = new ArrayList<T>(bucket.subList(0, batchSize));
+                bucket.subList(0, batchSize).clear();
+                ready.add(batch);
+            }
+            if (bucket.isEmpty()) {
+                it.remove();
             }
         }
-        return false;
-    }
-
-    public List<T> drainReadyBatch() {
-        Object readyKey = null;
-        for (Map.Entry<Object, List<T>> e : buckets.entrySet()) {
-            if (e.getValue().size() >= batchSize) {
-                readyKey = e.getKey();
-                break;
-            }
-        }
-        if (readyKey == null) {
-            return null;
-        }
-        // 先取到 key 再移除，避免在 entry 迭代中直接改 map 触发 ConcurrentModificationException
-        return buckets.remove(readyKey);
+        return ready;
     }
 
     public List<List<T>> drainAll() {
-        List<List<T>> all = new ArrayList<List<T>>(buckets.size());
-        for (List<T> bucket : buckets.values()) {
-            all.add(bucket);
-        }
+        List<List<T>> all = new ArrayList<List<T>>(buckets.values());
         buckets.clear();
         return all;
     }

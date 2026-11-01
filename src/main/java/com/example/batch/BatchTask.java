@@ -19,7 +19,7 @@ import java.util.concurrent.Semaphore;
  */
 public final class BatchTask<T, P> implements Runnable {
 
-    private final FileBatchPipeline<T, P> pipeline;
+    private final BatchPipeline<T, P> pipeline;
     private final PipelineConfig<T, P> config;
     private final PipelineStats stats;
     private final PartWriter<T, P> partWriter;
@@ -27,7 +27,7 @@ public final class BatchTask<T, P> implements Runnable {
     private final long batchSeq;
     private final List<T> batch;
 
-    BatchTask(FileBatchPipeline<T, P> pipeline, PipelineConfig<T, P> config, PipelineStats stats,
+    BatchTask(BatchPipeline<T, P> pipeline, PipelineConfig<T, P> config, PipelineStats stats,
               PartWriter<T, P> partWriter, Semaphore semaphore, long batchSeq, List<T> batch) {
         this.pipeline = pipeline;
         this.config = config;
@@ -86,13 +86,11 @@ public final class BatchTask<T, P> implements Runnable {
     private void handleBatchFailed(String errorCode, String message) throws IOException {
         int n = partWriter.writeBatchFailed(batchSeq, batch, errorCode, message);
         stats.addBatchFailed();
-        stats.addChannel(config.getErrorChannelKey(), n);
-        for (int i = 0; i < n; i++) {
-            stats.addRecordBatchFailed();
-        }
-        stats.addCode(errorCode);
+        stats.addChannel(OutputChannel.ERROR, n);
+        stats.addRecordBatchFailed(n);
+        stats.addCode(errorCode, n);
         PipelineLog.warn("批次 #%d 整批失败: code=%s msg=%s（%d 条已写入错误通道 %s）",
-                batchSeq, errorCode, message, n, config.getErrorChannelKey());
+                batchSeq, errorCode, message, n, OutputChannel.ERROR);
     }
 
     /** 按通道声明顺序拼一段稳定的描述，避免日志随线程调度抖动。 */
@@ -113,7 +111,7 @@ public final class BatchTask<T, P> implements Runnable {
 
     private void countResults(List<ItemResult<P>> results) {
         for (ItemResult<P> r : results) {
-            stats.addCode(r.getCode());
+            stats.addCode(r.getCode(), 1);
             if (r.isSuccess()) {
                 stats.addRecordSuccess();
             } else {

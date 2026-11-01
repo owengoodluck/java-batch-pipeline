@@ -4,11 +4,14 @@ import java.io.File;
 import java.util.regex.Pattern;
 
 /**
- * 一个输出通道：把「一类结果」绑定到「一个目标文件 + 一套行格式」。
+ * 一个输出通道：把「一类结果」绑定到「一个输出目标 + 一套行格式」。
  *
- * <p>用户不直接构造本类——通过 {@link PipelineConfig.Builder#channel(String, File, RecordFormatter)}
- * 声明。每个通道用同一个 {@link RecordFormatter}：普通通道只收到成功记录，错误通道
+ * <p>用户不直接构造本类——通过 {@link PipelineConfig.Builder#channel(String, ChannelTarget,
+ * RecordFormatter)} 声明。每个通道用同一个 {@link RecordFormatter}：普通通道只收到成功记录，错误通道
  * （key="error"）只收到失败记录，由路由决定一个 formatter 实例实际看到哪种结果。
+ *
+ * <p>输出目标由 {@link ChannelTarget} 抽象，落本地文件用 {@link ChannelTargets#file(File)}；
+ * 通道的分片目录则始终是本地的（见 {@link #partsDirOf(File)}）。
  *
  * <p><b>key 必须是稳定的 ASCII 标识</b>（如 {@code paid} / {@code shipped} / {@code error}），
  * 不要直接用中文状态名。原因很实际：key 会被用作分片子目录名
@@ -30,17 +33,18 @@ public final class OutputChannel<T, P> {
     private static final Pattern KEY_PATTERN = Pattern.compile("[A-Za-z0-9][A-Za-z0-9._-]{0,47}");
 
     private final String key;
-    private final File target;
+    private final ChannelTarget target;
     private final RecordFormatter<T, P> formatter;
     private final boolean createEmpty;
 
-    private OutputChannel(String key, File target, RecordFormatter<T, P> formatter, boolean createEmpty) {
+    private OutputChannel(String key, ChannelTarget target, RecordFormatter<T, P> formatter,
+                          boolean createEmpty) {
         if (key == null || !KEY_PATTERN.matcher(key).matches()) {
             throw new IllegalArgumentException(
                     "channel key 非法（字母/数字开头，仅含字母数字 . _ -，长度 1..48）: " + key);
         }
         if (target == null) {
-            throw new IllegalArgumentException("channel [" + key + "] 的 target 文件不能为空");
+            throw new IllegalArgumentException("channel [" + key + "] 的 target 不能为空");
         }
         if (formatter == null) {
             throw new IllegalArgumentException("channel [" + key + "] 的 formatter 不能为空");
@@ -51,8 +55,8 @@ public final class OutputChannel<T, P> {
         this.createEmpty = createEmpty;
     }
 
-    /** 普通业务通道或错误通道：绑定一个文件 + 一个行格式。 */
-    static <T, P> OutputChannel<T, P> of(String key, File target,
+    /** 普通业务通道或错误通道：绑定一个输出目标 + 一个行格式。 */
+    static <T, P> OutputChannel<T, P> of(String key, ChannelTarget target,
                                         RecordFormatter<T, P> formatter, boolean createEmpty) {
         return new OutputChannel<T, P>(key, target, formatter, createEmpty);
     }
@@ -71,7 +75,8 @@ public final class OutputChannel<T, P> {
         return key;
     }
 
-    public File getTarget() {
+    /** 该通道的输出目标。 */
+    public ChannelTarget getTarget() {
         return target;
     }
 
@@ -87,6 +92,6 @@ public final class OutputChannel<T, P> {
 
     @Override
     public String toString() {
-        return key + " -> " + target.getName();
+        return key + " -> " + target;
     }
 }

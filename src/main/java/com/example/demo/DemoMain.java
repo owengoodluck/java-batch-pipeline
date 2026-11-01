@@ -1,7 +1,8 @@
 package com.example.demo;
 
-import com.example.batch.BatchPipeline;
+import com.example.batch.BatchPipelines;
 import com.example.batch.BatchResult;
+import com.example.batch.ChannelTargets;
 import com.example.batch.PipelineConfig;
 import com.example.batch.PipelineExecutionException;
 import com.example.batch.PipelineLog;
@@ -17,6 +18,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.List;
 
@@ -28,7 +30,7 @@ import java.util.List;
  */
 public class DemoMain {
 
-    private static final Charset CS = Charset.forName("UTF-8");
+    private static final Charset CS = StandardCharsets.UTF_8;
     private static final int TOTAL_LINES = 1050;   // 故意不是 100 的整数倍，用于验证尾批
     private static final int BATCH_SIZE = 100;
     private static final int CONSUMER_THREADS = 4;
@@ -59,11 +61,13 @@ public class DemoMain {
                 .charset(CS)
                 .partsDir(partsDir)
                 // 没实现 RoutingProcessor：成功记录自动进 success 通道，失败记录进 error 通道。
+                // 两个通道给同一个 formatter 实例：它内部按 result.isSuccess() 自己决定行格式，
+                // 而路由保证成功通道只会收到成功记录、错误通道只会收到失败记录。
                 // createEmpty(true)：无记录时也生成空文件，保持下游"固定文件集"的读法。
-                .channel("success", new File(outputDir, "sample.success"),
-                        DemoLineFormatter.SUCCESS_TSV, true)
-                .errorChannel(new File(outputDir, "sample.error"),
-                        DemoLineFormatter.ERROR_TSV, true)
+                .channel("success", ChannelTargets.file(new File(outputDir, "sample.success")),
+                        new DemoLineFormatter(), true)
+                .errorChannel(ChannelTargets.file(new File(outputDir, "sample.error")),
+                        new DemoLineFormatter(), true)
                 .build();
 
         PipelineLog.info("输入文件: %s（共 %d 行）", input.getAbsolutePath(), TOTAL_LINES);
@@ -71,7 +75,7 @@ public class DemoMain {
                 : "专用 RecordReader 实现");
 
         try {
-            BatchResult result = BatchPipeline.run(config);
+            BatchResult result = BatchPipelines.run(config);
             PipelineLog.info("运行结果: %s", result);
         } catch (PipelineExecutionException e) {
             PipelineLog.error("流水线未正常完成: %s", e.getMessage());
@@ -89,11 +93,7 @@ public class DemoMain {
             // 方式 B：手上已有 read() 形态的工具类时，用适配器一行接入（原工具类不用改）
             final BufferedReader br = new BufferedReader(
                     new InputStreamReader(new FileInputStream(input), CS));
-            return RecordReaders.fromReadFunction(new RecordReaders.ExSupplier<String>() {
-                public String get() throws java.io.IOException {
-                    return br.readLine();
-                }
-            });
+            return RecordReaders.fromReadFunction(() -> br.readLine());
         }
         // 方式 A：专用实现（本 Demo 的 DemoLineReader）
         return new DemoLineReader(input, CS);

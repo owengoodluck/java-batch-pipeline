@@ -3,12 +3,12 @@
 | 项目 | 内容 |
 |---|---|
 | 文档名称 | 通用批处理流水线模板（Java）系统设计说明书 |
-| 版本 | v1.0 |
-| 日期 | 2026-10-31 |
+| 版本 | 当前设计（多通道 + 内置分组 + 可插拔输出目标） |
+| 日期 | 2026-11-01 |
 | 状态 | 已实现并通过验证 |
-| 运行环境 | JDK 8+（代码按 Java 8 兼容语法编写，JDK 20 实测通过） |
-| 第三方依赖 | 无（纯 JDK） |
-| 源码规模 | 19 个 Java 文件 / 约 1590 行 |
+| 运行环境 | JDK 8+（代码按 Java 8 语法编写，JDK 20 实测通过） |
+| 第三方依赖 | 无（纯 JDK，运行时零第三方依赖） |
+| 源码规模 | 41 个 Java 文件（内核 25 / 示例 12 / 测试 4）/ 约 4090 行 |
 
 ---
 
@@ -16,7 +16,7 @@
 
 ### 1.1 背景与目标
 
-业务侧存在一类**"有终点、有大批量数据"**的批处理任务：从一个数据源（文件）顺序读取记录，按固定批量调用远端 HTTP 接口逐批处理，最终把处理结果（原始记录 + 处理结果状态码 + 服务端返回的附加内容）落成一个统一的输出文件。
+业务侧存在一类**"有终点、有大批量数据"**的批处理任务：从一个数据源（文件）顺序读取记录，按固定批量调用远端 HTTP 接口逐批处理，最终把处理结果（原始记录 + 处理结果状态码 + 服务端返回的附加内容）落成一个或多个输出文件。
 
 这类任务的共性痛点：
 
@@ -36,9 +36,9 @@
 | 可配并发 | `consumerThreads`(N) + `bufferBatches`(B)，在途上限 = N + B |
 | 失败可区分 | 记录级失败与批次级失败均落错误通道，由错误码（如 `BATCH_*` 前缀）区分，无独立级别列 |
 | 数据不丢 | 任何路径下「输入行数 = 输出成功行数 + 错误行数」 |
-| 原子落地 | 先写 `*.tmp` 再 rename，下游不会读到半截文件 |
+| 原子落地 | 写入暂存流 → `commit()` 才对外可见（文件目标 = `.tmp` + 原子 rename），下游不会读到半截文件 |
 | 优雅停止 | 异常/中断时停在安全边界：在途批次跑完、不覆盖旧产出、保留分片现场 |
-| 零依赖 | 纯 JDK 并发工具，可直接 `javac` 编译运行 |
+| 零依赖 | 纯 JDK 并发工具；Maven 构建，运行时零第三方依赖 |
 
 ### 1.3 非目标（Out of Scope）
 
@@ -55,18 +55,18 @@
 
 | 编号 | 需求 | 实现位置 | 状态 |
 |---|---|---|---|
-| FR-1 | 采用生产者消费者模式 | `FileBatchPipeline` + `BatchTask` | 已实现 |
-| FR-2 | 生产者负责读取文件并累计成批 | `BatchProducer`（生产者线程） | 已实现 |
+| FR-1 | 采用生产者消费者模式 | `BatchPipeline` + `BatchTask` | 已实现 |
+| FR-2 | 生产者负责读取文件并累计成批 | 生产者线程 + `BatchingStrategy`（按数量 / 按 key 分组） | 已实现 |
 | FR-3 | 每累计 100 条做一次批处理 | `batchSize` 参数 + 尾批提交 | 已实现 |
-| FR-4 | 生产者约一个线程；消费者支持多线程，线程数可配 | `Thread(batach-producer)` + `ThreadPoolExecutor(N)` | 已实现 |
+| FR-4 | 生产者单线程；消费者支持多线程，线程数可配 | `Thread(batch-producer)` + `ThreadPoolExecutor(N)` | 已实现 |
 | FR-5 | 无闲置空间时生产者停止生产（背压） | `Semaphore(N+B)`，`acquirePermit()` | 已实现 |
 | FR-6 | 缓冲位数可配置 | `bufferBatches` 参数 | 已实现 |
-| FR-7 | 读取源可替换（通用接口） | `RecordReader` SPI + `RecordReaders` 适配器 | 已实现 |
+| FR-7 | 读取源可替换（通用接口） | `RecordReader` SPI + `RecordReaders` 适配器/组合器 | 已实现 |
 | FR-8 | 调用 HTTP 接口做批处理 | `BatchProcessor` SPI | 已实现（Demo 为模拟） |
-| FR-9 | 记录每条记录的处理结果状态码 | `ItemResult`（status/code/payload/message） | 已实现 |
-| FR-10 | 批次失败/记录失败均落盘，由错误码区分（批次失败用 `BATCH_*` 前缀） | 错误文件统一 `错误码 \t 错误信息 \t 原始记录` | 已实现 |
-| FR-11 | 成功与失败分流到两个独立输出文件 | `PartWriter` 双分片 + `OutputMerger` 双合并 | 已实现 |
-| FR-12 | 所有批次结果最终合并成统一输出文件 | `OutputMerger`（按序号升序流式合并） | 已实现 |
+| FR-9 | 记录每条记录的处理结果状态码 | `ItemResult`（success 布尔位 + code/payload/message） | 已实现 |
+| FR-10 | 批次失败/记录失败均落盘，由错误码区分 | 失败行统一由通道的 `RecordFormatter` 渲染（Demo 为 `错误码 \t 错误信息 \t 原始记录`） | 已实现 |
+| FR-11 | 成功与失败分流到独立输出文件（可扩展到多通道） | `PartWriter` 按通道路由分片 + `OutputMerger` 逐通道交付 | 已实现 |
+| FR-12 | 每个通道的批次结果最终合并成该通道的一个输出 | `OutputMerger`（按序号升序流式合并 → `ChannelTarget.commit()`） | 已实现 |
 | FR-13 | 输出格式按文件类型可替换 | `RecordFormatter` SPI（成功/错误通道共用） | 已实现 |
 | FR-14 | 失败后继续处理后续批次（不 fail-fast） | `BatchTask.handleBatchFailed()` | 已实现 |
 | FR-15 | 读取异常时终止整个流程 | `abort()` + 生产者 catch Throwable | 已实现 |
@@ -78,11 +78,11 @@
 |---|---|---|---|
 | NFR-1 | 内存占用与文件大小无关 | 在途上限 M 固定，最坏驻留 (N+B)×batchSize 条 | 上界可证 |
 | NFR-2 | 数据零丢失 | 三条守恒校验 + 失败必落盘 + 兜底失效即停止 | 已验证 |
-| NFR-3 | 输出文件原子可见 | `write tmp → ATOMIC_MOVE rename` | 已实现 |
+| NFR-3 | 输出文件原子可见 | `ChannelTarget`：写入暂存流 → `commit()` 才对外可见（文件实现 = `write .tmp → ATOMIC_MOVE`） | 已实现 |
 | NFR-4 | 失败可诊断 | 分片保留、错误码分布统计、批次序号溯源 | 已验证 |
 | NFR-5 | 可观测 | 统计指标 + 分级日志（含背压提示） | 已实现 |
 | NFR-6 | 可移植 | 仅用 JDK 8 API，无第三方依赖 | JDK20 实测 |
-| NFR-7 | 可扩展 | 三个 SPI 接口，内核零业务耦合 | Demo 双实现验证 |
+| NFR-7 | 可扩展 | 读取 / 处理 / 格式化 / 路由 / 输出目标全部是 SPI，内核零业务耦合 | Demo 多形态 + 27 个单测 |
 | NFR-8 | 优雅停机 | 支持 JVM 关闭钩子与在途批次等待上限 | 已实现 |
 
 ### 2.3 约束与假设
@@ -107,7 +107,7 @@
                 │              │                 │
 ┌───────────────▼──────────────▼─────────────────▼─────────────┐
 │  编排层（Orchestration）                                       │
-│  FileBatchPipeline：生命周期、参数装配、停止传播、合并调度        │
+│  BatchPipeline：生命周期、参数装配、停止传播、合并调度        │
 └───────────────┬──────────────────────────────────────────────┘
                 │
 ┌───────────────▼──────────────────────────────────────────────┐
@@ -117,7 +117,8 @@
                 │
 ┌───────────────▼──────────────────────────────────────────────┐
 │  存储层（Persistence）                                         │
-│  PartWriter（分片写入/分流）    OutputMerger（合并/原子rename） │
+│  PartWriter（分片写入/分流）  OutputMerger（合并）             │
+│  ChannelTarget（交付：open 暂存 / commit 可见）                │
 └───────────────┬──────────────────────────────────────────────┘
                 │
 ┌───────────────▼──────────────────────────────────────────────┐
@@ -132,8 +133,9 @@
 
 | 模块 | 包名 | 职责 | 是否需改动 |
 |---|---|---|---|
-| 内核 core | `com.example.batch` | 并发、背压、落盘、合并、统计、停机 | 不需要 |
+| 内核 core | `com.example.batch` | 并发、背压、落盘、合并、交付、统计、停机 | 通用不变（分组为 opt-in，仅成批层可替换，见 §15.2–15.3） |
 | 业务实现 demo | `com.example.demo` | 读取/调用/格式化的具体实现 | 替换为生产实现 |
+| 测试 | `src/test/java/com/example/batch` | 成批策略、读取组合器与端到端行为 | 随内核改动同步更新 |
 
 ### 3.3 系统架构图
 
@@ -148,20 +150,21 @@ flowchart TB
 
     subgraph CORE["内核层 - 通用不变"]
         direction TB
-        PIPE["FileBatchPipeline<br/>编排·生命周期·停止传播"]
+        PIPE["BatchPipeline<br/>编排·生命周期·停止传播"]
         PROD["生产者线程 batch-producer<br/>read → 攒批 → 申请名额"]
         SEM["Semaphore<br/>名额 = N + B"]
         POOL["ThreadPoolExecutor<br/>N 个 batch-consumer 线程"]
         TASK["BatchTask<br/>单批: 调用 → 分流 → 归还名额"]
-        PW["PartWriter<br/>写本批 success/error 分片"]
-        MG["OutputMerger<br/>合并 → tmp → rename"]
+        PW["PartWriter<br/>写本批各通道分片"]
+        MG["OutputMerger<br/>按通道合并"]
+        CT["ChannelTarget<br/>open 暂存 / commit 可见"]
         ST["PipelineStats<br/>行数·批次·状态码分布·耗时"]
         CFG["PipelineConfig<br/>参数 + SPI 装配"]
     end
 
-    subgraph FS["存储"]
+    subgraph FS["存储 / 交付"]
         PART["parts/<br/>paid/part-000007.part<br/>error/part-000007.part"]
-        SUC["output/… 各通道目标文件<br/>（如 sample.success / order.paid）"]
+        SUC["各通道输出目标<br/>（如 sample.success / order.paid）"]
         ERR["output/sample.error<br/>错误记录：错误码/信息/原始记录"]
     end
 
@@ -177,8 +180,9 @@ flowchart TB
     PIPE --> PROD
     PIPE --> MG
     PART --> MG
-    MG --> SUC
-    MG --> ERR
+    MG --> CT
+    CT --> SUC
+    CT --> ERR
     TASK --> ST
     CFG -.->|注入| PIPE
     APP -.->|接口注入| CORE
@@ -197,7 +201,22 @@ classDiagram
     class RecordReaders {
         <<utility>>
         +fromIterator(Iterator~T~) RecordReader~T~
+        +fromIterable(Iterable~T~) RecordReader~T~
         +fromReadFunction(ExSupplier~T~) RecordReader~T~
+        +skipping(src, n) RecordReader~T~
+        +filtering(src, keep) RecordReader~T~
+        +headerAware(src, isHeader) RecordReader~T~
+        +footerAware(src, isFooter) RecordReader~T~
+        +mapping(src, fn) RecordReader~O~
+    }
+    class ChannelTarget {
+        <<interface>>
+        +open() OutputStream
+        +commit()
+    }
+    class ChannelTargets {
+        <<utility>>
+        +file(File) ChannelTarget
     }
     class BatchProcessor~T_P~ {
         <<interface>>
@@ -221,13 +240,13 @@ classDiagram
         -String errorCode
         +getErrorCode() String
     }
-    class FileBatchPipeline~T_P~ {
+    class BatchPipeline~T_P~ {
         -PipelineConfig config
         -PipelineStats stats
-        -AtomicBoolean aborted
+        -AtomicReference abortState
         -Semaphore semaphore
         -ExecutorService pool
-        +run()
+        +run() BatchResult
         +abort(Throwable)
         -produce()
         -submitBatch(long, List~T~)
@@ -244,12 +263,24 @@ classDiagram
         -handleBatchFailed(String, String)
     }
     class PartWriter~T_P~ {
-        +writeResults(seq, batch, results) int[]
-        +writeBatchFailed(seq, batch, code, msg) int
+        +writeResults(long, List~T~, List~ItemResult~P~~) Map~String,Integer~
+        +writeBatchFailed(long, List~T~, String, String) int
+    }
+    class BatchingStrategy~T~ {
+        <<interface>>
+        +add(T)
+        +drainReadyBatches() List~List~T~~
+        +drainAll() List~List~T~~
+    }
+    class CountBatchingStrategy~T~ {
+        -List~T~ pending
+    }
+    class GroupBatchingStrategy~T_K~ {
+        -Map~K,List~T~~ buckets
     }
     class OutputMerger {
         <<utility>>
-        +merge(partsDir, target, ext, charset, createEmpty) long
+        +merge(channelPartsDir, target, charset, createEmpty) long
         +cleanup(partsDir)
     }
     class PipelineConfig~T_P~ {
@@ -266,11 +297,20 @@ classDiagram
         +printSummary()
     }
 
-    FileBatchPipeline --> PipelineConfig : 持有
-    FileBatchPipeline --> PipelineStats : 持有
-    FileBatchPipeline --> BatchTask : 提交
-    FileBatchPipeline --> OutputMerger : 合并
-    FileBatchPipeline ..> RecordReader : 依赖(注入)
+    BatchPipeline --> PipelineConfig : 持有
+    BatchPipeline --> PipelineStats : 持有
+    BatchPipeline --> BatchingStrategy : 生产者使用（按数量 / 按分组键）
+    BatchPipeline --> ChannelRouter : 分流
+    BatchingStrategy <|.. CountBatchingStrategy
+    BatchingStrategy <|.. GroupBatchingStrategy
+    GroupBatchingStrategy ..> GroupKeyExtractor : 取分组键
+    BatchPipeline --> BatchTask : 提交
+    BatchPipeline --> OutputMerger : 合并
+    BatchPipeline ..> RecordReader : 依赖(注入)
+    PipelineConfig --> OutputChannel : 通道表
+    OutputChannel --> ChannelTarget : 输出目标
+    ChannelTargets ..> ChannelTarget : 创建
+    OutputMerger ..> ChannelTarget : 写入并提交
     BatchTask --> BatchProcessor : 调用(注入)
     BatchTask --> PartWriter : 写分片
     BatchTask ..> RecordFormatter : 通过PartWriter使用（成功/错误通道共用）
@@ -298,7 +338,7 @@ classDiagram
 
 ```mermaid
 flowchart LR
-    A["生产者: read() 逐条读取"] --> B{"batch.size() >= batchSize ?"}
+    A["生产者: read() 逐条读取"] --> B{"攒满一批?<br/>按数量: size = batchSize<br/>分组: 某桶攒满 batchSize"}
     B -- 否 --> A
     B -- 是 --> C["先攒满一批<br/>再申请名额"]
     C --> D{"Semaphore<br/>有剩余名额?"}
@@ -323,6 +363,8 @@ flowchart LR
 **为什么不用有界队列做背压？**
 
 有界队列限制的是"排队中的批次条数/个数"，它与"正在被处理的批次数"是两个概念：当两个消费者都在忙时，队列未满就意味着生产者仍可继续提交，这与需求「消费者都在工作时不应再生产批次」不符。信号量直接对"在途未完成批次数"建模，语义精确。
+
+**分组模式下的背压（见 §15）**：内置分组只改 `produce()` 的"攒批"段（按 key 入桶、满 `batchSize` flush 单组批次），背压机制本身完全不变——在途上限 `M = N + B` 仍成立，信号量名额仍在 `BatchTask.run()` 的 `finally` 中归还。`batchSize` 在分组模式下语义变为"每桶 flush 阈值"，但名额模型不受影响；内存上界变为 `组数 × (batchSize-1) + (N+B) × batchSize`（与输入总量 N 无关）。
 
 ### 4.3 内存模型
 
@@ -353,7 +395,7 @@ flowchart TB
     G -- 否 --> I{"aborted?"}
     H --> I
     I -- 是 --> J["保留 parts/<br/>WARN: 不产出半截结果"]
-    I -- 否 --> K["mergeOutputs(): 合并 → tmp → rename"]
+    I -- 否 --> K["mergeOutputs()：逐通道合并 → target.commit()"]
     K --> L["清理分片目录"]
     J --> M["释放资源: 关 reader、注销钩子"]
     L --> M
@@ -367,23 +409,19 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    A([生产者启动]) --> B{"aborted? 且 reader.hasNext()?"}
-    B -- 否 --> Z([结束])
+    A([生产者启动]) --> B{"未中止 且 reader.hasNext()?"}
+    B -- 否 --> I["strat.drainAll()<br/>尾批兜底 flush"]
     B -- 是 --> C["record = reader.next()"]
-    C -->|异常| H["abort(cause)<br/>ERROR 日志: 读取失败"]
-    C -->|正常| D["batch.add(record)<br/>stats.addRead(1)"]
-    D --> E{"batch 满 batchSize?"}
-    E -- 否 --> B
-    E -- 是 --> F["submitBatch(seq, batch)<br/>acquire → execute → 新建 batch"]
+    C -->|异常| H["abort(cause)<br/>ERROR 日志: 生产者异常"]
+    C -->|正常| D["stats.addRead(1)<br/>strat.add(record)（分组时按键入桶）"]
+    D --> E["for batch in strat.drainReadyBatches()"]
+    E --> F["submitBatch(seq, batch)<br/>acquire 名额 → execute"]
     F -->|InterruptedException| H
     F -->|正常| B
-    Z --> I{"存在未提交的尾批?"}
-    I -- 是 --> J["提交尾批<br/>(不足 batchSize 的剩余记录)"]
-    I -- 否 --> K([INFO: 生产者结束])
-    J --> K
+    I --> K([INFO: 生产者结束])
 ```
 
-> **尾批处理**：当总记录数不是 `batchSize` 的整数倍时，剩余的不足一批的记录会在循环结束后单独提交，不会丢失。Demo 采用 1050 行输入正是为验证这条路径。
+> **尾批处理**：当总记录数不是 `batchSize` 的整数倍时，剩余的不足一批的记录由 `drainAll()` 兜底提交；分组模式下各桶未满的部分同样在此刻全部提交。Demo 采用 1050 行输入正是为验证这条路径（11 批，末批 50 条）。
 
 ### 5.3 消费者流程（单批 BatchTask）
 
@@ -412,17 +450,17 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    A["parts/ 目录"] --> B["列出 *.success.part<br/>按文件名升序(零填充序号)"]
-    A --> B2["列出 *.error.part<br/>按文件名升序"]
-    B --> C["流式追加写 sample.success.tmp"]
-    B2 --> C2["流式追加写 sample.error.tmp"]
-    C --> D["ATOMIC_MOVE rename<br/>→ output/sample.success"]
-    C2 --> D2["ATOMIC_MOVE rename<br/>→ output/sample.error"]
-    D --> E["删除 parts/ 目录"]
-    D2 --> E
+    A["parts/{key}/ 目录<br/>（逐通道串行）"] --> B["列出 part-*.part<br/>按文件名升序（零填充序号）"]
+    B --> C["逐分片流式写入<br/>target.open() 给出的暂存流"]
+    C --> D["关闭流 → target.commit()<br/>（文件实现为 ATOMIC_MOVE）"]
+    D --> E{"所有通道都成功?"}
+    E -- 是 --> F["按 deletePartsOnSuccess 清理 parts/"]
+    E -- 否 --> G["保留 parts/，异常上抛"]
 ```
 
 > 由于文件名前缀为 `part-%06d`（零填充），字典序即批次序号，因此**合并结果天然保持输入文件的行序**；这是分片方案的附带收益，无需额外排序。
+>
+> 每个通道独立走一遍 `open → 写入 → close → commit`，某个通道失败不会破坏其他通道已提交的结果；交付目标的差异（本地文件 / 对象存储）全在 `ChannelTarget` 实现里（见 §14.8）。
 
 ### 5.5 关键时序图：读取异常导致的全局停止
 
@@ -440,13 +478,13 @@ sequenceDiagram
     P->>S: acquire()
     P->>C2: execute(BatchTask #2)
     P->>P: read() 第35条抛 IOException
-    P->>M: abort(cause) → aborted=true
+    P->>M: abort(cause)（状态与原因原子发布）
     Note over P: 退出读循环，<br/>不再提交新批次
     C1-->>S: release() (批次1完成)
     C2-->>S: release() (批次2完成)
     M->>M: pool.shutdown() + awaitTermination
     Note over M: 在途批次全部跑完
-    M->>M: aborted=true → 跳过合并
+    M->>M: 已中止 → 跳过合并
     Note over M: 保留 parts/，<br/>不覆盖旧输出文件
     M->>M: 打印统计 + 抛出 PipelineExecutionException
 ```
@@ -463,9 +501,9 @@ stateDiagram-v2
     RUNNING --> STOPPING: 读取异常/兜底失效/JVM关闭
     BACKPRESSURE --> STOPPING: aborted 置位
     STOPPING --> DRAINING: 等在途批次完成
-    DRAINING --> ABORTED: 有未停止原因
+    DRAINING --> ABORTED: 中止状态已置位
     RUNNING --> MERGING: 生产者正常读完
-    MERGING --> COMPLETED: 合并 rename 成功
+    MERGING --> COMPLETED: 各通道 merge + commit 成功
     MERGING --> FAILED: 合并失败(保留分片)
     ABORTED --> [*]
     COMPLETED --> [*]
@@ -490,13 +528,13 @@ flowchart TB
     JUDGE -- 是 --> OKLINE["成功行<br/>原始记录 + 状态码 + 附加内容"]
     JUDGE -- 否 --> NGLINE["失败行<br/>原始记录 + 错误码 + 消息"]
     CALL -->|"整批异常"| BFLINE["失败行（批次级）<br/>原始记录 + 错误码 + 消息"]
-    OKLINE --> PS["part-NNNNNN.success.part"]
-    NGLINE --> PE["part-NNNNNN.error.part"]
+    OKLINE --> PS["parts/{通道key}/part-NNNNNN.part"]
+    NGLINE --> PE["parts/error/part-NNNNNN.part"]
     BFLINE --> PE
-    PS --> MERGE["OutputMerger<br/>按序号升序合并"]
+    PS --> MERGE["OutputMerger<br/>逐通道按序号升序合并"]
     PE --> MERGE
-    MERGE --> OUTS["output/sample.success"]
-    MERGE --> OUTE["output/sample.error"]
+    MERGE --> OUTS["ChannelTarget.commit()<br/>（如 output/sample.success）"]
+    MERGE --> OUTE["ChannelTarget.commit()<br/>（如 output/sample.error）"]
 ```
 
 ### 6.2 目录与文件命名规范
@@ -524,7 +562,7 @@ flowchart TB
 | 文件 | 规则 | 目的 |
 |---|---|---|
 | 通道分片 | `{通道key}/part-%06d.part` | 零填充保证字典序 = 批次序号；按 key 分子目录，合并时扫一个目录即可 |
-| 临时输出 | `{目标文件名}.tmp` | 写完后 rename，保证原子可见 |
+| 临时输出 | `{目标}.tmp` | 由 `ChannelTarget` 实现自行决定：文件目标写同目录 `.tmp` 再 rename，保证原子可见 |
 | 不存在的分片 | 不创建（只有真正有记录时才 openWriter） | "本批该通道无数据" 由此自然可判，无需额外计数 |
 
 **为什么按通道分子目录，而不是 `part-000001.paid.part`**：
@@ -541,8 +579,8 @@ macOS/Linux 正常，但跨 Windows 打包、zip 解压、CI 缓存时经常乱�
 - 合并成功 → 删除整个 `parts/` 目录（含各通道子目录，受 `deletePartsOnSuccess` 控制）；
 - 流水线中止 → **保留** `parts/`，作为现场用于排查或后续续跑。
 
-> 注意：`prepareDirectories()` 必须**递归**清理 `parts/`。多通道下里面是子目录，
-> 早期实现用 `f.delete()` 只能删空目录，会残留上次运行的分片并被合并进本次输出。
+> 注意：`prepareDirectories()` 必须**递归**清理 `parts/`。多通道下里面是各通道子目录，
+> 若只删空目录（不递归）会残留上次运行的分片并被合并进本次输出。
 
 ### 6.3 输出格式规格
 
@@ -614,7 +652,7 @@ flowchart TB
 | 场景 | 检测位置 | 处理动作 | 是否继续 |
 |---|---|---|---|
 | `hasNext()/next()` 抛异常 | 生产者循环 catch Throwable | 记录异常原因并 abort → 停止读取与提交 | 否 |
-| `BatchFailedException` | `BatchTask.processBatch` | 整批写 error 分片（BATCH，错误码取自异常） | **是** |
+| `BatchFailedException` | `BatchTask.processBatch` | 整批写 error 分片（批次级，错误码取自异常） | **是** |
 | processor 抛其他 `Exception` | `BatchTask.processBatch` | 同上，错误码标记 `UNKNOWN` | **是** |
 | 结果条数与批次不符 | `BatchTask` 防御校验 | 同上，错误码标记 `BAD_RESPONSE` | **是** |
 | 写分片 IOException | `BatchTask.run` | `pipeline.abort()`（兜底失效，不可静默） | 否 |
@@ -622,16 +660,16 @@ flowchart TB
 | 线程池拒绝任务 | `submitBatch` | release 名额 + abort | 否 |
 | JVM 关闭信号 | ShutdownHook | abort，生产者 200ms 内感知退出 | 否（优雅） |
 | 等待在途批次超时 | `awaitTermination` | `shutdownNow()` 强制关闭 | 收尾 |
-| 合并失败 | `mergeOutputs` | 保留分片、不 rename，异常上抛 | 否 |
+| 合并失败 | `mergeOutputs` | 保留分片、不 `commit`，异常上抛 | 否 |
 
 ### 7.3 停止传播机制
 
 ```mermaid
 flowchart LR
-    T1["BatchTask 写分片失败"] --> A["AtomicBoolean aborted = true"]
+    T1["BatchTask 写分片失败"] --> A["中止状态置位<br/>（状态与原因原子发布）"]
     T2["生产者读取异常"] --> A
     T3["JVM ShutdownHook"] --> A
-    A --> P1["生产者: 读循环条件<br/>while(!aborted && hasNext)"]
+    A --> P1["生产者: 读循环条件<br/>while(!isAborted() && hasNext)"]
     A --> P2["生产者: acquirePermit<br/>每 200ms 检查 aborted"]
     A --> P3["生产者: submitBatch<br/>提交前再次检查"]
     P1 --> S1["停止读取新记录"]
@@ -653,8 +691,8 @@ flowchart LR
 
 ```java
 public interface RecordReader<T> extends Closeable {
-    boolean hasNext() throws Exception;
-    T next() throws Exception;
+    boolean hasNext() throws IOException;
+    T next() throws IOException;
 }
 ```
 
@@ -662,12 +700,12 @@ public interface RecordReader<T> extends Closeable {
 |---|---|
 | 结束判定 | 由 `hasNext()` 返回 false 表达，**不使用 null 作为结束标记** |
 | 调用顺序 | 仅在 `hasNext()` 为 true 后调用 `next()` |
-| 异常 | 允许抛受检异常，内核捕获后触发全局停止 |
+| 异常 | 允许抛 `IOException`，内核捕获后触发全局停止 |
 | 资源释放 | 实现 `close()`，内核在收尾阶段必定调用 |
 
 **设计说明**：采用 `hasNext/next` 形态而非 `read()` 返回 null，是因为后者依赖隐含约定且在某些数据格式下会产生歧义；同时相比 JDK 的 `Iterator`（其 `next()` 无法声明受检异常），自定接口能让 IO 异常原样穿透，不必包装成运行时异常后在上层解包。
 
-**适配器**：见 `RecordReaders.fromIterator()` / `fromReadFunction()`，内部通过预读缓存实现 `hasNext()`。
+**适配器与组合器**：`RecordReaders.fromIterator()` / `fromIterable()` / `fromReadFunction()` 把现有读取工具接进来（内部用预读缓存实现 `hasNext()`）；`skipping / filtering / headerAware / footerAware / mapping` 用于丢弃表头、过滤空行、丢掉表尾、转换形态，全部是装饰器，`close()` 委派给源 reader。
 
 ### 8.2 BatchProcessor<T, P>
 
@@ -701,7 +739,7 @@ public interface RecordFormatter<T, P> {
 | 返回值 | 单行文本，**不应包含换行符**（内核统一追加 `\n`） |
 | 成功通道 | 只收到成功结果，`result.isSuccess()` 为 true，读 `result.getPayload()` |
 | 错误通道（key="error"） | 只收到失败结果，读 `result.getCode()` / `result.getMessage()`；批次失败与记录失败的区别体现在错误码（如 `BATCH_*` 前缀） |
-| 为什么只有一个接口 | 早期版本拆成 `RecordFormatter` + `ErrorFormatter` 两个接口，但二者本质都是「记录 + 结果 → 一行」，合并后概念更少、API 更统一，且单方法天然支持 lambda |
+| 为什么只有一个接口 | 成功与失败的渲染本质都是「记录 + 结果 → 一行」，合并成单方法接口概念更少、API 更统一，且天然支持 lambda |
 
 ### 8.4 ItemResult<P>
 
@@ -722,18 +760,19 @@ public interface RecordFormatter<T, P> {
 |---|---|---|---|---|
 | `reader` | `RecordReader<T>` | — | ✅ | 读取实现 |
 | `processor` | `BatchProcessor<T,P>` | — | ✅ | 批处理实现 |
-| `channels` | `Map<String, OutputChannel<T,P>>` | — | ✅ | 输出通道表（含必填的错误通道，见 §11.2） |
+| `channels` | `Map<String, OutputChannel<T,P>>` | — | ✅ | 输出通道表：由 `channel(...)` / `errorChannel(...)` 声明，错误通道必填（见 §14） |
 | `batchSize` | int | 100 | | 每批条数，> 0 |
 | `consumerThreads` | int | 2 | | 并行消费者线程数 N，> 0 |
 | `bufferBatches` | int | 1 | | 缓冲位数 B，≥ 0 |
-| `partsDir` | File | — | ✅ | 分片目录 |
+| `partsDir` | File | 系统临时目录 | | 分片目录（并行阶段的本地暂存区，与输出目标解耦） |
 | `awaitTerminationSeconds` | long | 60 | | 等待在途批次上限 |
 | `charset` | Charset | UTF-8 | | 读写编码 |
 | `deletePartsOnSuccess` | boolean | true | | 合并成功后清理分片 |
+| `groupExtractor` | `GroupKeyExtractor<T,K>` | null | | 批量前按字段分组（opt-in）；null = 按 `batchSize` 数量攒批，见 §15 |
 
 通道的空文件策略是 per-channel 的（`OutputChannel.createEmpty`，默认 false）。
 
-派生量：`maxInflightBatches = max(N, N + B)`（当 B 为负时自动保护）。
+派生量：`maxInflightBatches = consumerThreads + bufferBatches`（`build()` 已校验 B ≥ 0，因此无需再取 max）。
 
 ### 9.2 调参建议
 
@@ -760,11 +799,13 @@ public interface RecordFormatter<T, P> {
 | **状态码分布** | `errorCodeCounts` | 一眼看出哪类错误最多 |
 | 总耗时 / 平均每批耗时 | 起止时间 | 性能评估与调参依据 |
 
+状态码分布统一按**记录**计数：记录级结果按条累加，批次级失败按其牵连的记录数累加，因此各码次数之和等于读取记录数（守恒可直接核对）。
+
 ### 10.2 日志约定
 
 | 级别 | 场景 | 示例 |
 |---|---|---|
-| INFO | 启动参数、每批完成、生产者结束、合并结果、汇总 | `批次 #7 完成: 成功 98 条 / 记录级失败 2 条` |
+| INFO | 启动参数、每批完成、生产者结束、合并结果、汇总 | `批次 #7 完成: success 97 条 / error 3 条` |
 | WARN | 批次级失败、背压等待、提前中止、停机超时 | `批次 #5 整批失败: code=HTTP_500 …` |
 | ERROR | 读取失败、兜底写入失败、致命错误 | `写入分片失败，触发全局停止` |
 
@@ -782,15 +823,19 @@ public interface RecordFormatter<T, P> {
 2. 实现 `BatchProcessor<YourRecord, YourPayload>`（换成真实的批量 HTTP 调用）；
 3. 提供一个 `RecordFormatter<YourRecord, YourPayload>`（lambda 即可）：成功通道读 `getPayload()`，错误通道读 `getCode()`/`getMessage()`，同一个接口覆盖两种结果。
 
-### 11.2 已预留的扩展点
+### 11.2 可扩展点
 
-| 扩展点 | 方式 |
-|---|---|
-| 输出还需第三种文件（如告警文件） | **已实现（v1.1）**：`channel("alarm", file, fmt)` 声明即可，见 §14 |
-| 需要批次结果明细留存 | 在 `BatchTask` 中增加 `ResultCollector` 回调 |
-| 需要进程级断点续跑 | 读取异常时 `parts/` 已保留，按最大批次序号跳过已处理批次即可实现 |
-| 需要 Prometheus 指标 | 从 `PipelineStats` 取值导出 |
-| 需要动态限流 | 将 `Semaphore` 替换为可调整许可数的信号量包装 |
+> 下表是"有需求时往哪里加"的指引。除第一行外都**需要改动内核**，不是当前已存在的钩子——
+> 不要凭这张表臆造 API。
+
+| 扩展点 | 方式 | 是否需改内核 |
+|---|---|---|
+| 输出还需第三种文件（如告警文件） | 用 `channel("alarm", target, fmt)` 声明即可，见 §14 | 否（已支持） |
+| 输出要落到 S3 / OSS / HTTP，不止本地文件 | 实现 `ChannelTarget` 并传入，内核无需改动，见 §14.8 | 否（已支持） |
+| 需要批次结果明细留存 | 在 `BatchTask` 中增加回调，把 `process()` 的返回值顺带交给使用方 | 是 |
+| 需要进程级断点续跑 | 读取异常时 `parts/` 已保留，按最大批次序号跳过已处理批次即可实现 | 是 |
+| 需要 Prometheus 指标 | 从 `PipelineStats` 取值导出 | 否（读取即可） |
+| 需要动态限流 | 将 `Semaphore` 替换为可调整许可数的信号量包装 | 是 |
 
 ### 11.3 明确的职责边界
 
@@ -810,36 +855,43 @@ public interface RecordFormatter<T, P> {
 
 | # | 验证项 | 方法 | 结果 |
 |---|---|---|---|
-| 1 | 正常批处理与尾批 | 1050 行输入 → 11 批（最后一批 50 条） | PASS |
-| 2 | 数据守恒（统计层） | 成功 + 记录级失败 + 批次牵连 == 读取总数 | PASS |
-| 3 | 数据守恒（文件层） | 主输出行数 + 错误文件行数 == 输入行数（105 = 73 + 32） | PASS |
-| 4 | 批次级失败落盘 | 注入 25% 批次失败 → 2 批失败，20 条全部进错误文件 | PASS |
-| 5 | 失败可区分 | 错误文件含失败结果与错误码，由错误码区分记录级 / 批次级 | PASS |
-| 6 | 背压生效 | 消费者耗时大于读取速度时日志出现等待提示 | PASS |
-| 7 | 合并保持行序 | 合并后首列字典序单调不减 | PASS |
-| 8 | 读取异常全局停止 | 第 35 条抛 IOException → 停在 34 条并抛出异常 | PASS |
-| 9 | 中止时不覆盖旧产出 | 预置旧文件在异常流程后内容未被修改 | PASS |
-| 10 | 中止时保留现场 | `parts/` 目录保留已完成的批次分片 | PASS |
-| 11 | 适配器读取方式 | `fromReadFunction` 包装 read() 工具类，结果与专用实现一致 | PASS |
+| 1 | 正常批处理与尾批 | Demo：1050 行 → 11 批（最后一批 50 条） | PASS |
+| 2 | 数据守恒（统计层） | 成功 + 记录级失败 + 批次牵连 == 读取总数（995 + 55 + 0 = 1050） | PASS |
+| 3 | 数据守恒（文件层） | 主输出 995 行 + 错误文件 55 行 == 输入 1050 行 | PASS |
+| 4 | 批次级失败落盘 | 单测 `batchFailureWholeBatchToError`：50 条整批进错误通道，成功 0 条 | PASS |
+| 5 | 记录级失败分流 | 单测 `errorChannelConservationOnRecordFailure`：Σ各通道行数 == 输入条数 | PASS |
+| 6 | 背压生效 | 消费者耗时大于读取速度时日志出现等待提示 | PASS（人工） |
+| 7 | 合并保持行序 | 单测 `customChannelTargetReceivesWholeMergedOutput`：10+10+5 分片合并后与输入序一致 | PASS |
+| 8 | 读取异常全局停止 | 第 35 条抛 IOException → 停在 34 条并抛出异常 | PASS（人工） |
+| 9 | 中止时不覆盖旧产出 | 预置旧文件在异常流程后内容未被修改 | PASS（人工） |
+| 10 | 中止时保留现场 | `parts/` 目录保留已完成的批次分片 | PASS（人工） |
+| 11 | 适配器与读取组合器 | 单测 `RecordReadersTest`（11 例）：适配器一致性 + 跳过/过滤/表头/表尾/映射 | PASS |
+| 12 | 内置分组单组保证 | Demo：120 条 → 12 个单组批次；单测 `groupingSingleGroupGuaranteeAndConservation` | PASS |
+| 13 | 多通道分流与兜底 | Demo：1000 = 397 + 298 + 149 + 99 + 57；未注册状态 50 条兜底并告警 | PASS |
+| 14 | 输出目标可替换 | 单测用内存 `ChannelTarget` 验证 open/commit 各一次、内容完整 | PASS |
+
+单测合计 **27 个用例**，`mvn test` 全绿（见 §13.1 的测试文件清单）。
 
 ### 12.2 实测运行数据（Demo 默认配置）
 
 ```
 输入 1050 行 · batchSize=100 · consumers=4 · buffer=1 · maxInflight=5
+Demo 注入 3% 批次失败 / 5% 记录级失败（固定 seed，结果可复现）
 
 读取记录数        : 1050
 提交批次数        : 11
 成功批次数        : 11
 批次级失败批次数  : 0
-成功记录数        : 996
-记录级失败数      : 54
-失败记录合计      : 54
-总耗时            : 492 ms
-平均每批耗时      : 44 ms
-状态码分布        : OK 996 / E3003 21 / E2002 17 / E1001 16
+成功记录数        : 995
+记录级失败数      : 55
+批次失败牵连记录数: 0
+失败记录合计      : 55
+总耗时            : 约 545 ms
+平均每批耗时      : 约 49 ms
+状态码分布        : OK 995 / E3003 19 / E2002 19 / E1001 17
 ```
 
-产物：`demo-run/output/sample.success`（996 行）、`demo-run/output/sample.error`（54 行）。
+产物：`demo-run/output/sample.success`（995 行）、`demo-run/output/sample.error`（55 行）。
 
 ---
 
@@ -849,17 +901,23 @@ public interface RecordFormatter<T, P> {
 
 | 文件 | 对应设计章节 |
 |---|---|
-| `FileBatchPipeline.java` | 5.1 主流程 / 5.2 生产者 / 4.2 背压 / 7.3 停止传播 |
+| `BatchPipeline.java` | 5.1 主流程 / 5.2 生产者 / 4.2 背压 / 7.3 停止传播（内核编排） |
+| `BatchPipelines.java` | 一行式入口 |
 | `BatchTask.java` | 5.3 消费者流程 / 7.2 异常矩阵 |
-| `RecordReader.java` / `RecordReaders.java` | 8.1 读取接口与适配器 |
-| `BatchProcessor.java` / `ItemResult.java` / `BatchFailedException.java` | 8.2 / 8.4 处理契约 |
-| `RecordFormatter.java` | 8.3 输出契约（成功/错误通道共用） |
+| `RecordReader.java` / `RecordReaders.java` | 8.1 读取接口、适配器与组合器 |
+| `BatchProcessor.java` / `RoutingProcessor.java` | 8.2 处理契约 / 14.3 多通道路由 |
+| `ItemResult.java` / `BatchFailedException.java` | 8.4 / 7.2 结果模型与批次失败 |
+| `RecordFormatter.java` | 8.3 输出契约（所有通道共用） |
+| `OutputChannel.java` / `ChannelRouter.java` | 14.2 / 14.4 通道定义与分流 |
+| `ChannelTarget.java` / `ChannelTargets.java` | 14.8 输出目标抽象与工厂 |
 | `PartWriter.java` | 6.1 数据流 / 6.2 分片命名 |
 | `OutputMerger.java` | 5.4 合并流程 / 6.2 目录规范 |
 | `PipelineConfig.java` | 9 配置规格 |
-| `PipelineStats.java` | 10.1 统计指标 |
-| `DemoLineReader/DemoHttpProcessor/DemoLineFormatter/DemoMain/DemoOrder*` | 11 扩展实践示例 |
-| `BatchResult.java` / `BatchPipeline.java` | 10.1 统计指标（快照） / 一行式入口 |
+| `PipelineStats.java` / `BatchResult.java` | 10.1 统计指标与只读快照 |
+| `BatchingStrategy.java` / `CountBatchingStrategy.java` / `GroupBatchingStrategy.java` / `GroupKeyExtractor.java` | 15 内置分组批处理 |
+| `PipelineLog.java` / `PipelineExecutionException.java` | 日志与异常约定 |
+| `DemoLineReader/DemoHttpProcessor/DemoLineFormatter/DemoMain/DemoOrder*/DemoGroup*` | 11 扩展实践示例 |
+| `CountBatchingStrategyTest` / `GroupBatchingStrategyTest` / `RecordReadersTest` / `BatchPipelineTest` | 12 验证记录（27 个用例） |
 
 ### 13.2 术语表
 
@@ -889,20 +947,21 @@ A：有，但**在通道内部**。分片按批次序号零填充命名，合并
 
 ---
 
-## 14. 多输出通道（v1.1）
+## 14. 多输出通道
 
 ### 14.1 动机
 
-v1.0 的分流是硬编码二选一，散落在五处：`PipelineConfig` 四个字段、`PartWriter` 两个后缀常量、
-`PartWriter.writeResults` 的 `if/else`、`BatchTask` 的 `int[]{ok,ng}`、`mergeOutputs` 的两次固定调用。
+把"成功/失败两个出口"硬编码在编排里，意味着每加一种输出就要改内核：通道定义散落在配置、分片写入、
+合并三处，出口数量与合并次数都是写死的。这条路往下走只有不断给内核打补丁。
 
 真实场景是「按业务状态分文件」：批量查订单状态，已付款 / 已发货 / 已完成 / 已取消 各一个文件，
-查询失败与未识别状态进错误文件。这不是"多几个文件名"，而是**通道必须成为一等公民**。
+查询失败与未识别状态进错误文件。这不是"多几个文件名"，而是**通道必须成为一等公民**——
+声明式地描述"有哪些出口、各自格式如何"，内核只负责按路由写、按通道合并。
 
 ### 14.2 通道模型
 
 ```java
-OutputChannel<T, P> = key + target(File) + formatter + createEmpty
+OutputChannel<T, P> = key + target(ChannelTarget) + formatter + createEmpty
 ```
 
 - 声明期（`build()`）确定全部通道，运行期只读；
@@ -912,7 +971,7 @@ OutputChannel<T, P> = key + target(File) + formatter + createEmpty
 
 ### 14.3 路由
 
-`RoutingProcessor<T,P>` 是 `BatchProcessor` 的**可选**扩展，不实现则行为与 v1.0 完全一致。
+`RoutingProcessor<T,P>` 是 `BatchProcessor` 的**可选**扩展；不实现时按默认规则：成功进 `success`、失败进 `error`。
 
 解析顺序（`ChannelRouter.resolve`）：
 
@@ -935,7 +994,7 @@ OutputChannel<T, P> = key + target(File) + formatter + createEmpty
 兜底记录往往"业务上是成功的"（如订单状态查到了，但那个状态没有对应通道）。若按成功格式
 写入错误文件，错误文件里就会混入列数不同的行，下游按列解析直接错位。
 
-处理：`PartWriter.format()` 对 fallback 记录合成一条 `UNROUTED:{requestedKey}` 的失败结果，
+处理：`PartWriter.formatLine(...)` 对 fallback 记录合成一条 `UNROUTED:{requestedKey}` 的失败结果，
 强制走错误格式：
 
 ```
@@ -944,8 +1003,8 @@ UNROUTED:partial_shipped	通道 partial_shipped 未注册（原始结果码 PART
 
 **② 分片目录的递归清理**
 多通道下 `parts/` 里是子目录，`File.delete()` 只能删空目录。若不递归，上次运行的分片会残留
-并被合并进本次输出——这类 bug 极难发现（数据"变多了"，但不报错）。`prepareDirectories()` 现改为
-`OutputMerger.deleteChildren()` 递归清理，并检查 `delete()` 返回值。
+并被合并进本次输出——这类 bug 极难发现（数据"变多了"，但不报错）。因此 `prepareDirectories()`
+用 `OutputMerger.deleteChildren()` 递归清理，并检查 `delete()` 返回值。
 
 ### 14.5 守恒关系
 
@@ -957,36 +1016,17 @@ UNROUTED:partial_shipped	通道 partial_shipped 未注册（原始结果码 PART
 
 批次级失败整批计入错误通道，不破坏该等式。Demo 实测 `1000 = 397 + 298 + 149 + 99 + 57`。
 
-**注意**：`PipelineStats` 的「失败记录合计」只统计 `FAILED` 与 BATCH 牵连记录，不含 fallback；
+**注意**：`PipelineStats` 的「失败记录合计」只统计记录级失败与批次级失败牵连的记录，不含 fallback；
 fallback 有独立计数（`ChannelRouter.unregisteredTotal()`）。两者不要混看。
 
-### 14.6 v1.1 / v1.2 移除的旧 API（迁移对照）
+### 14.6 通道 API 的使用契约
 
-**v1.2（当前）**：formatter 拆分、异常收窄、`OutcomeStatus` 删除。
-
-| v1.1 写法（已移除） | v1.2 等价写法 |
-|---|---|
-| `LineFormatter`（三方法，每个通道都要实现） | 所有通道 → `RecordFormatter`（单方法，可 lambda；成功读 payload、错误读 code/message） |
-| `channel(key, file, lineFormatter)` | `channel(key, file, recordFormatter)` —— 普通通道只收成功、错误通道只收失败，由路由保证；两者共用同一个 `RecordFormatter` 类型 |
-| `OutputChannel.of(key, file, fmt)` / `OutputChannel.error(file, fmt)` | 从用户 API 移除；错误通道改走 builder 的 `errorChannel(...)`，其余走 `channel(...)` |
-| `OutputChannel.error(...).createEmpty(true)` | `errorChannel(file, fmt, true)` |
-| `channelOf` 里 `if (!result.isSuccess()) return null;` | 删掉——`channelOf` 只对成功记录调用，失败一律自动进错误通道 |
-| `ItemResult.getStatus()` / `OutcomeStatus` | 删除——用 `isSuccess()`，内部是布尔位 |
-| `RecordReader` 方法 `throws Exception` | 收窄为 `throws IOException` |
-| `new FileBatchPipeline<>(config).run()`（void） | `run()` 返回 `BatchResult` 快照；或一行式 `BatchPipeline.run(config)` |
-
-输出格式统一为单个 `RecordFormatter` 后，错误通道用专用 `errorChannel(...)` 声明（兜底安全网，构建期校验必须存在），成功与业务通道用 `channel(...)`。
+错误通道用专用 `errorChannel(...)` 声明（兜底安全网，构建期校验必须存在），成功与业务通道用 `channel(...)`。
 构建期仅对**错误通道这一个**做存在性校验（缺失直接报错，避免首次失败才崩溃）；其余通道不做校验，
 把"信任用户配置、保持 API 简洁"放在"编译期防呆"之前。
 
-**v1.1**：v1.0 的二通道写法（`successFile/errorFile/successFormatter/errorFormatter/createEmptyOutput`）
-整体移除，内核与配置层只有一套通道 API：
-
-| v1.0 写法 | 等价写法 |
-|---|---|
-| `successFile(f)` + `successFormatter(fmt)` | `channel("success", f, fmt)`（保留 key） |
-| `errorFile(f)` + `errorFormatter(fmt)` | `errorChannel(f, fmt)` |
-| `createEmptyOutput(true)`（全局） | 对需要的通道用带 `createEmpty` 参数的重载 |
+所有通道共用同一个 `RecordFormatter` 类型：普通通道只收成功结果、错误通道只收失败结果，由路由保证，
+因此一套 lambda 即可同时服务成功与错误格式（成功读 `payload`、错误读 `code`/`message`）。
 
 ### 14.7 明确不支持的两种形态
 
@@ -996,6 +1036,33 @@ fallback 有独立计数（`ChannelRouter.unregisteredTotal()`）。两者不要
 | **一对多产出**（100 条输入 → 120 条输出） | 会破坏 `BatchTask` 的 1:1 校验（这是"一条不丢"的唯一凭据），守恒式要换成"输入覆盖率 100%"，还要给每行加源记录序号才能追溯与重试。代价远超收益 |
 
 若确实需要，应作为独立设计评审，而不是在现有 SPI 上打补丁。
+
+### 14.8 输出目标抽象（ChannelTarget）
+
+通道的**最终归宿**由 `ChannelTarget` 描述，落本地文件只是内置的一种实现：
+
+```java
+public interface ChannelTarget {
+    OutputStream open()   throws IOException;   // 打开暂存流，框架写入合并结果，写完即关闭
+    void         commit() throws IOException;   // 提交：只在流关闭后调用，此时结果才对外可见
+}
+```
+
+**为什么要两阶段**：流水线的输出本身就是两阶段的——并行阶段各批次写自己的分片（互不干扰），
+收尾阶段按批次序号有序合并。把"写入"与"提交"分开，才能守住核心保证：**下游永远不会看到写了一半的输出**。
+对文件实现而言，就是写同目录 `.tmp` 再 `ATOMIC_MOVE`（同目录 = 同一文件系统，才有文件系统级原子性），
+不支持时退化为普通 move。
+
+**关键取舍：只抽象最终交付，不抽象分片目录。** 分片目录（`.partsDir(...)`）始终是本地暂存区，
+与输出目标解耦。因此：
+
+- `charset`、`partsDir`、`deletePartsOnSuccess` 三项配置**全部继续有效且不泄漏**——
+  它们描述的是"本地暂存 + 文本编码"这一阶段，而这一阶段对任何输出目标都存在；
+- 若把分片也一并抽象掉，这三项对远程目标会立刻变成死配置，抽象随即漏掉；
+- 附带收益：远程写入失败（如上传中断）时分片仍在本地，`commit()` 可重试，不必重跑整条流水线。
+
+**框架保持零第三方依赖**：S3/OSS 等实现由使用方提供（实现 `ChannelTarget` 传入即可），
+内核不引入任何 SDK。写法见 README「输出目标」一节。
 
 ---
 
@@ -1013,23 +1080,25 @@ fallback 有独立计数（`ChannelRouter.unregisteredTotal()`）。两者不要
 
 ### 15.2 设计：策略模式 + opt-in
 
-把"如何成批"从 `produce()` 抽成接口，默认实现字节级等价于现状：
+把"如何成批"从 `produce()` 抽成接口，默认实现与按数量攒批的行为完全一致：
 
 ```java
 interface BatchingStrategy<T> {
-    void add(T record) throws IOException;
-    boolean hasReadyBatch();
-    List<T> drainReadyBatch();        // 取一个就绪批次并清空
-    List<List<T>> drainAll();         // EOF 时取出所有未满剩余批次
+    void add(T record);
+    List<List<T>> drainReadyBatches();   // 一次取走所有就绪批次；无则返回空 list
+    List<List<T>> drainAll();            // EOF 时取出所有未满剩余批次
 }
 ```
 
+取批是**一次调用**：实现内部判断哪些批次达到 flush 阈值并一次全部返回，
+不设"先问有没有、再取一个"的两段式入口，也不以 `null` 表示"无就绪批次"。
+
 | 实现 | 行为 | 何时用 |
 |---|---|---|
-| `CountBatchingStrategy<T>` | 单 pending 列表，`size >= batchSize` 才就绪（= 现 `produce()` 逻辑） | 未配置分组（默认） |
-| `GroupBatchingStrategy<T,K>` | 持有 `Map<K, List<T>>` 桶；任一桶满 `batchSize` 即就绪；EOF 取全部剩余桶 | 配置了 `groupBy` |
+| `CountBatchingStrategy<T>` | 单 pending 列表，`size >= batchSize` 时整批交出 | 未配置分组（默认） |
+| `GroupBatchingStrategy<T,K>` | 持有 `Map<K, List<T>>` 桶；攒满的桶按 `batchSize` 切片交出；EOF 取全部剩余桶 | 配置了 `groupBy` |
 
-`PipelineConfig` 新增**可空**字段 `groupExtractor` 与 `Builder.groupBy(GroupKeyExtractor)`。不配置时 `produce()` 用 `CountBatchingStrategy`，行为完全不变；配置后改用 `GroupBatchingStrategy`。`batchSize` 复用为"每桶 flush 阈值"。`build()` 不新增强制校验（error 通道既有校验保留）。
+`PipelineConfig` 提供**可空**字段 `groupExtractor` 与 `Builder.groupBy(GroupKeyExtractor)`。不配置时 `produce()` 用 `CountBatchingStrategy`，行为不变；配置后改用 `GroupBatchingStrategy`。`batchSize` 复用为"每桶 flush 阈值"。`build()` 除错误通道外不新增强制校验。
 
 ### 15.3 生产者改动（仅替换攒批段）
 
@@ -1039,10 +1108,14 @@ BatchingStrategy<T> strat = (groupExtractor == null)
     : new GroupBatchingStrategy<>(batchSize, groupExtractor);
 while (reader.hasNext()) {
     strat.add(reader.next());
-    while (strat.hasReadyBatch()) submit(strat.drainReadyBatch());
+    for (List<T> b : strat.drainReadyBatches()) submit(b);
 }
 for (List<T> b : strat.drainAll()) submit(b);   // EOF 兜底 flush，防丢数据
 ```
+
+生产者每读一条就取一次批，因此攒满即发；即便取批节奏放慢，
+`GroupBatchingStrategy` 也会把超长的桶切成 `batchSize` 大小的批次，
+下游不会收到超过 `batchSize` 的批次。
 
 生产者流程（分组模式）：
 
@@ -1052,10 +1125,11 @@ flowchart TB
     B -- 否 --> Z([结束])
     B -- 是 --> C["rec = reader.next()"]
     C --> D["strat.add(rec)<br/>按 key 落入 Bucket"]
-    D --> E{"strat.hasReadyBatch()?"}
-    E -- 是 --> F["submit(strat.drainReadyBatch())<br/>单组整批 → BatchProcessor"]
-    F --> E
-    E -- 否 --> B
+    D --> E["ready = strat.drainReadyBatches()"]
+    E --> F{"ready 非空?"}
+    F -- 是 --> G["逐批 submit(batch)<br/>单组整批 → BatchProcessor"]
+    G --> E
+    F -- 否 --> B
     Z --> G{"strat.drainAll()<br/>非空?"}
     G -- 是 --> H["提交剩余未满 bucket"]
     G -- 否 --> I([INFO: 生产者结束])
@@ -1068,14 +1142,16 @@ flowchart TB
 
 1. **单组保证**：每次 `BatchProcessor.process()` 收到的 batch 只含同一个 key。
 2. **大组自动切片**：组记录数 > `batchSize` → 拆成多个单组整批，每批仍单组。
-3. **EOF 不丢数据**：未满 bucket 在 reader 耗尽时兜底 flush（否则尾批静默丢失）。
-4. **向后兼容**：未配置 `groupBy` 时与 v1.2 行为完全一致。
+3. **批次长度不超 `batchSize`**：切片由策略内部完成，不依赖调用方的取批节奏。
+4. **EOF 不丢数据**：未满 bucket 在 reader 耗尽时兜底 flush（否则尾批静默丢失）。
+5. **默认行为**：未配置 `groupBy` 时，框架使用 `CountBatchingStrategy` 按数量攒批，每满 batchSize 提交一批。
 
 `BatchTask` 的 `size == batch.size()` 顺序校验天然成立（每个桶 flush 出的仍是 `List<T>`，顺序保持），落盘/合并逻辑零改动。
 
 ### 15.5 基数约束（关键，决定复杂度）
 
-`GroupBatchingStrategy` 为每个不同 key 在内存保留一个 bucket，流式过程中峰值驻留 ≈ `组数 × (batchSize-1)` 条。
+`GroupBatchingStrategy` 为每个不同 key 在内存保留一个 bucket，各桶合计 ≤ `组数 × (batchSize-1)` 条；
+再叠加在途批次 `(N+B) × batchSize`，两者都与输入总量无关。
 
 | 分组基数 | 可行性 | 措施 |
 |---|---|---|
@@ -1084,11 +1160,14 @@ flowchart TB
 
 **本设计面向低基数**。中高基数场景应改用**外部分文件预处理**（按 key 落不同文件后各自跑流水线），不要靠本能力——本能力不适合高基数。这与 §14.7"动态分区"不同：动态分区是要把数据拆出成千上万个文件（需分区治理、路径消毒、跨批 key 合并），而本能力是固定的少数几组、每组仍是一次普通批处理。
 
-### 15.6 边界处理（实现时定）
+### 15.6 边界处理
 
-- **key 为 `null`**：归入一个独立 "null bucket"（多占一个桶，低基数下仍安全），文档说明；或由 `build()` 校验拒绝——实现时择一。
-- **抽取抛 `IOException`**：直接上抛，`produce()` 现有异常终止逻辑接管（全局停止）。
-- **`drainReadyBatch` 选择哪个满桶**：低基数下按 `LinkedHashMap` 插入序取首个达标桶即可（O(组数) 扫描，≤10 可忽略）。
+- **key 为 `null`**：归入一个独立的 "null bucket"（多占一个桶，低基数下仍安全）。
+  实现上遍历用迭代器 `remove()`，不需要区分"没找到"与"key 恰好是 null"。
+- **一次取到多个就绪批次**：按 `LinkedHashMap` 插入序遍历所有攒满的桶，
+  每个桶切成若干个长度恰为 `batchSize` 的批次，余量留在桶里等下次或 EOF。
+- **分组键提取不抛受检异常**：`GroupKeyExtractor.extract` 只做取字段/计算，
+  与 `RoutingProcessor.channelOf` 契约一致；实现若涉及 IO 请自行包装为运行时异常。
 
 ### 15.7 参数表（已实现）
 
@@ -1100,5 +1179,7 @@ flowchart TB
 
 ### 15.8 改动范围声明
 
-本次是**有意、受控地扩展内核成批层**：新增 `BatchingStrategy` 接口 + 两个实现，`produce()` 改用策略。它**不是"改坏核心"**，而是该规约下被显式批准的、最小侵入的 opt-in 扩展——不配置 `groupBy` 时零行为变化，所有 SPI 契约不变。实现时须在 §3.2 模块划分与 §4.2 背压中将 core 标记为"需改动（分组模式）"，并在 `agents.md` §10 同步说明。
+分组能力以内置策略的形式落在**成批层**，是 opt-in 的最小侵入扩展：`BatchingStrategy` 接口 + 两个实现，
+`produce()` 只替换攒批段。不配置 `groupBy` 时行为不变，所有 SPI 契约不变；编排、背压、落盘、合并、统计
+均不受影响（见 §3.2、§4.2，以及 `agents.md` §10 的编码规约）。
 

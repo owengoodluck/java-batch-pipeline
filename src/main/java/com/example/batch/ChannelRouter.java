@@ -1,5 +1,6 @@
 package com.example.batch;
 
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -59,7 +60,6 @@ public final class ChannelRouter<T, P> {
 
     private final BatchProcessor<T, P> processor;
     private final Map<String, OutputChannel<T, P>> channels;
-    private final String errorKey;
     private final ConcurrentHashMap<String, AtomicLong> unregistered =
             new ConcurrentHashMap<String, AtomicLong>();
     /** 成功记录被显式指到错误通道的次数（该通道只收失败行，会被拨回 success）。 */
@@ -68,7 +68,6 @@ public final class ChannelRouter<T, P> {
     ChannelRouter(PipelineConfig<T, P> config) {
         this.processor = config.getProcessor();
         this.channels = config.getChannels();
-        this.errorKey = config.getErrorChannelKey();
     }
 
     public Route resolve(int indexInBatch, T record, ItemResult<P> result) {
@@ -80,7 +79,7 @@ public final class ChannelRouter<T, P> {
                     : null;
             if (requested == null) {
                 key = OutputChannel.SUCCESS;
-            } else if (errorKey.equals(requested)) {
+            } else if (OutputChannel.ERROR.equals(requested)) {
                 // 错误通道只收失败行（同一个 RecordFormatter 只渲染失败结果）：
                 // 成功记录指过来无法落盘，拨回 success 并一次性告警
                 noteSuccessToError(indexInBatch, record);
@@ -90,14 +89,14 @@ public final class ChannelRouter<T, P> {
             }
         } else {
             requested = null;
-            key = errorKey;
+            key = OutputChannel.ERROR;
         }
 
         if (channels.containsKey(key)) {
             return new Route(key, requested, false);
         }
         noteUnregistered(key, indexInBatch, record);
-        return new Route(errorKey, key, true);
+        return new Route(OutputChannel.ERROR, key, true);
     }
 
     private void noteUnregistered(String key, int indexInBatch, T record) {
@@ -106,7 +105,7 @@ public final class ChannelRouter<T, P> {
             // 只报首次，避免一个批次 100 条刷 100 行日志；总次数在汇总里给
             PipelineLog.warn("未注册的输出通道 \"%s\"（批次内下标 %d，记录 %s），已兜底到 \"%s\"。"
                             + "请检查配置声明与处理器返回值是否有拼写或空格差异。",
-                    key, indexInBatch, String.valueOf(record), errorKey);
+                    key, indexInBatch, String.valueOf(record), OutputChannel.ERROR);
         }
     }
 
@@ -115,7 +114,7 @@ public final class ChannelRouter<T, P> {
         if (n == 1L) {
             PipelineLog.warn("成功记录被指到错误通道 \"%s\"（批次内下标 %d，记录 %s），"
                             + "已拨回 \"%s\" 通道。错误通道只承载失败行。",
-                    errorKey, indexInBatch, String.valueOf(record), OutputChannel.SUCCESS);
+                    OutputChannel.ERROR, indexInBatch, String.valueOf(record), OutputChannel.SUCCESS);
         }
     }
 
@@ -146,7 +145,7 @@ public final class ChannelRouter<T, P> {
     }
 
     private static Map<String, Long> snapshot(ConcurrentHashMap<String, AtomicLong> map) {
-        Map<String, Long> snapshot = new java.util.LinkedHashMap<String, Long>();
+        Map<String, Long> snapshot = new LinkedHashMap<String, Long>();
         for (Map.Entry<String, AtomicLong> e : map.entrySet()) {
             snapshot.put(e.getKey(), e.getValue().get());
         }
