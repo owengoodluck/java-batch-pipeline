@@ -204,9 +204,12 @@ public class MyFormatter implements LineFormatter<MyRecord, MyPayload> {
 ```java
 new FileBatchPipeline<>(PipelineConfig.<MyRecord, MyPayload>builder()
         .reader(reader).processor(processor)
-        .successFormatter(formatter).errorFormatter(formatter)
         .batchSize(100).consumerThreads(4).bufferBatches(1)
-        .partsDir(partsDir).successFile(successFile).errorFile(errorFile)
+        .partsDir(partsDir)
+        // 输出是通道表：key → 文件 + 格式。error 通道必须存在（errorChannel 快捷方法）。
+        .channel("success", successFile, formatter)          // 保留 key：未实现 RoutingProcessor 时成功记录落这
+        .errorChannel(errorFile, formatter)                  // 保留 key：失败与未注册路由落这
+        // .channel("review", reviewFile, reviewFormatter)  // 需要分流时再加，配合 RoutingProcessor
         .build()).run();
 ```
 
@@ -222,7 +225,8 @@ new FileBatchPipeline<>(PipelineConfig.<MyRecord, MyPayload>builder()
 | `awaitTerminationSeconds` | 60 | 停止时等待在途批次的上限，超限强制关闭线程池 |
 | `charset` | UTF-8 | 读写编码 |
 | `deletePartsOnSuccess` | true | 合并成功后清理分片目录 |
-| `createEmptyOutput` | true | 无成功/错误记录时是否仍生成空文件 |
+
+输出侧没有全局的"空文件开关"——它是**每个通道自己的属性**：`OutputChannel.of(...).createEmpty(true)`。默认不生成，需要固定文件集的下游对个别通道打开。
 
 **调参建议**：批处理（写库/调接口）通常远慢于"读 100 行文本"，所以 `B = 1` 基本就能消除消费者空等；`B` 再往上加只是白占内存。`consumerThreads` 则取决于接口服务端的并发承受能力。
 

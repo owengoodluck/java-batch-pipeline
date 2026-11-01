@@ -1,6 +1,7 @@
 package com.example.demo;
 
 import com.example.batch.FileBatchPipeline;
+import com.example.batch.OutputChannel;
 import com.example.batch.PipelineConfig;
 import com.example.batch.PipelineExecutionException;
 import com.example.batch.PipelineLog;
@@ -52,16 +53,20 @@ public class DemoMain {
         PipelineConfig<String, String> config = PipelineConfig.<String, String>builder()
                 .reader(reader)
                 .processor(processor)
-                .successFormatter(formatter)
-                .errorFormatter(formatter)
                 .batchSize(BATCH_SIZE)
                 .consumerThreads(CONSUMER_THREADS)
                 .bufferBatches(BUFFER_BATCHES)
                 .awaitTerminationSeconds(60L)
                 .charset(CS)
                 .partsDir(partsDir)
-                .successFile(new File(outputDir, "sample.success"))
-                .errorFile(new File(outputDir, "sample.error"))
+                // success / error 是两个保留通道 key；这里不实现 RoutingProcessor，
+                // 路由自动退化为"成功 → success，失败 → error"，与最早的二通道行为一致。
+                // createEmpty(true)：无记录时也生成空文件，保持下游"固定文件集"的读法。
+                .channel(OutputChannel.<String, String>of(
+                        OutputChannel.SUCCESS, new File(outputDir, "sample.success"), formatter)
+                        .createEmpty(true))
+                .channel(OutputChannel.<String, String>error(
+                        new File(outputDir, "sample.error"), formatter).createEmpty(true))
                 .build();
 
         PipelineLog.info("输入文件: %s（共 %d 行）", input.getAbsolutePath(), TOTAL_LINES);

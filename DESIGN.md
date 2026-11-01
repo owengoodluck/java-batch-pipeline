@@ -719,18 +719,16 @@ public interface LineFormatter<T, P> {
 |---|---|---|---|---|
 | `reader` | `RecordReader<T>` | — | ✅ | 读取实现 |
 | `processor` | `BatchProcessor<T,P>` | — | ✅ | 批处理实现 |
-| `successFormatter` | `LineFormatter<T,P>` | — | ✅ | 主输出行格式 |
-| `errorFormatter` | `LineFormatter<T,P>` | — | ✅ | 错误文件行格式 |
+| `channels` | `Map<String, OutputChannel<T,P>>` | — | ✅ | 输出通道表（含必填的错误通道，见 §11.2） |
 | `batchSize` | int | 100 | | 每批条数，> 0 |
 | `consumerThreads` | int | 2 | | 并行消费者线程数 N，> 0 |
 | `bufferBatches` | int | 1 | | 缓冲位数 B，≥ 0 |
 | `partsDir` | File | — | ✅ | 分片目录 |
-| `successFile` | File | — | ✅ | 主输出文件 |
-| `errorFile` | File | — | ✅ | 错误输出文件 |
 | `awaitTerminationSeconds` | long | 60 | | 等待在途批次上限 |
 | `charset` | Charset | UTF-8 | | 读写编码 |
 | `deletePartsOnSuccess` | boolean | true | | 合并成功后清理分片 |
-| `createEmptyOutput` | boolean | true | | 无记录时是否仍生成空文件 |
+
+通道的空文件策略是 per-channel 的（`OutputChannel.createEmpty`，默认 false）。
 
 派生量：`maxInflightBatches = max(N, N + B)`（当 B 为负时自动保护）。
 
@@ -958,16 +956,21 @@ ORD-000095|CUST-00096|45.15	RECORD	UNROUTED:partial_shipped	通道 partial_shipp
 **注意**：`PipelineStats` 的「失败记录合计」只统计 `FAILED` 与 BATCH 牵连记录，不含 fallback；
 fallback 有独立计数（`ChannelRouter.unregisteredTotal()`）。两者不要混看。
 
-### 14.6 与 v1.0 的兼容性
+### 14.6 v1.1 起移除的旧 API（迁移对照）
 
-| 老用法 | 行为 |
+v1.0 的二通道写法在通道化改造初期以语法糖形式保留过一段时间，现已**整体移除**，
+内核与配置层只有一套通道 API。旧写法 → 新写法的对照：
+
+| v1.0 写法（已移除） | 现在的等价写法 |
 |---|---|
-| `successFile` + `successFormatter` | build 时自动转为 `success` 通道 |
-| `errorFile` + `errorFormatter` | build 时自动转为 `error` 通道 |
-| 处理器只实现 `BatchProcessor` | 路由退化为"成功→success，失败→error"，与 v1.0 一致 |
-| `createEmptyOutput` | 作为老 API 两通道的 `createEmpty` 默认值 |
+| `successFile(f)` + `successFormatter(fmt)` | `channel("success", f, fmt)`（保留 key） |
+| `errorFile(f)` + `errorFormatter(fmt)` | `errorChannel(f, fmt)` 或 `channel(OutputChannel.error(f, fmt))` |
+| `createEmptyOutput(true)`（全局） | 对需要的通道单独调 `OutputChannel.of(...).createEmpty(true)` |
+| 处理器只实现 `BatchProcessor` | 不变：路由退化为"成功→success，失败→error" |
 
-老 Demo（`DemoMain` + `DemoHttpProcessor`）源码零改动，实测输出与 v1.0 逐行一致（`1050 = 997 + 53`）。
+`build()` 现在额外做一道角色校验：key 为 `error` 的通道必须用 `OutputChannel.error(...)`
+声明（`isErrorChannel == true`），用 `channel("error", ...)` 声明成普通通道会被直接拒绝——
+否则兜底与批次级失败会写进一个语义上是"普通输出"的通道，下游无法区分。
 
 ### 14.7 明确不支持的两种形态
 
