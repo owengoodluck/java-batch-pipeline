@@ -65,8 +65,8 @@ public class DemoOrderMain {
                 .channel("shipped", new File(outDir, "order.shipped"), DemoLineFormatter.SUCCESS_TSV)
                 .channel("completed", new File(outDir, "order.completed"), DemoLineFormatter.SUCCESS_TSV)
                 .channel("cancelled", new File(outDir, "order.cancelled"), DemoLineFormatter.SUCCESS_TSV)
-                // 错误通道收两类失败行：查询失败（RECORD）与未注册状态兜底
-                .channel("error", new File(outDir, "order.error"), DemoLineFormatter.ERROR_TSV)
+                // 错误通道（兜底）：查询失败与未注册状态兜底都落这里
+                .errorChannel(new File(outDir, "order.error"), DemoLineFormatter.ERROR_TSV)
                 .build();
 
         BatchResult result = BatchPipeline.run(config);

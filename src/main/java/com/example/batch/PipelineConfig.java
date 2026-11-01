@@ -17,16 +17,16 @@ import java.util.Map;
  *     .processor(processor)
  *     .channel("success", new File(dir, "order.success"), successFormatter)  // 成功记录落这里
  *     .channel("paid",    new File(dir, "order.paid"),    paidFormatter)    // 额外分流通道
- *     .channel("error",   new File(dir, "order.error"),   errFormatter)      // 失败记录落这里
+ *     .errorChannel(new File(dir, "order.error"), errFormatter)             // 兜底：失败记录落这里
  *     .build();
  * </pre>
  *
- * <p>三类约定（不是三种 API，都是同一个 {@code channel(...)}）：
+ * <p>三类约定（普通通道用 {@code channel(...)}，错误通道用专用的 {@code errorChannel(...)}）：
  * <ul>
  *   <li><b>success</b>：未实现 {@link RoutingProcessor} 时，所有成功记录的默认去向；
  *       实现了时它可作 {@code channelOf} 返回 null 的兜底。</li>
- *   <li><b>error</b>（key 固定为 {@code "error"}）：记录级失败、批次级失败、未注册路由全部落这里，
- *       一个通道即可，只收失败结果。</li>
+ *   <li><b>error</b>（key 固定为 {@code "error"}，由 {@link #errorChannel} 声明）：记录级失败、
+ *       批次级失败、未注册路由全部落这里，是整条流水线的兜底安全网——缺失会在 {@link #build()} 时报错。</li>
  *   <li><b>其它 key</b>（paid / shipped …）：配合 {@link RoutingProcessor#channelOf} 按业务状态再分流。</li>
  * </ul>
  *
@@ -166,6 +166,23 @@ public final class PipelineConfig<T, P> {
             return add(OutputChannel.of(key, target, formatter, createEmpty));
         }
 
+        /**
+         * 声明错误通道（兜底安全网）：所有失败记录的归宿。
+         *
+         * <p>该通道 key 固定为 {@link OutputChannel#ERROR}（即 {@code "error"}），由本方法内部设定，
+         * 调用方无需也不能改成别的名字——失败的路由目标在引擎里写死为这个 key。
+         * 它是整条流水线的兜底：缺失会在 {@link #build()} 时报错，避免“首次失败才崩溃”。
+         */
+        public Builder<T, P> errorChannel(File target, RecordFormatter<T, P> formatter) {
+            return errorChannel(target, formatter, false);
+        }
+
+        /** 声明错误通道，并指定无失败时是否仍生成空文件。 */
+        public Builder<T, P> errorChannel(File target, RecordFormatter<T, P> formatter,
+                                          boolean createEmpty) {
+            return add(OutputChannel.of(OutputChannel.ERROR, target, formatter, createEmpty));
+        }
+
         private Builder<T, P> add(OutputChannel<T, P> channel) {
             OutputChannel<T, P> prev = channels.put(channel.getKey(), channel);
             if (prev != null) {
@@ -238,6 +255,12 @@ public final class PipelineConfig<T, P> {
 
             Map<String, OutputChannel<T, P>> resolved =
                     new LinkedHashMap<String, OutputChannel<T, P>>(channels);
+            if (!resolved.containsKey(OutputChannel.ERROR)) {
+                throw new IllegalArgumentException(
+                        "必须声明错误通道（兜底安全网）：调用 errorChannel(file, formatter)。"
+                                + "记录级失败、批次级失败与未注册路由都落这里，"
+                                + "缺失会导致首次失败时整条流水线中止。");
+            }
             return new PipelineConfig<T, P>(this, resolved, OutputChannel.ERROR);
         }
     }

@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.example</groupId>
+    <artifactId>java-batch-pipeline</artifactId>
+    <version>1.2.0</version>
+    <packaging>jar</packaging>
+
+    <name>通用批处理流水线模板</name>
+    <description>
+        面向"有终点、有大批量数据"的批处理场景：单线程读文件 → 每 N 条打包成一批 →
+        多线程并发调用批量接口 → 按结果分流到多个输出文件。零第三方依赖，纯 JDK 即可编译运行。
+    </description>
+
+    <properties>
+        <!-- 使用与项目约定一致的 Java 8 字节码目标 -->
+        <maven.compiler.release>8</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+    </properties>
+
+    <dependencies>
+        <!-- 本框架零第三方运行时依赖；真实业务所需的 HTTP/DB 驱动由使用方自行引入 -->
+    </dependencies>
+
+    <build>
+        <finalName>${project.artifactId}</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.11.0</version>
+                <configuration>
+                    <release>8</release>
+                    <encoding>UTF-8</encoding>
+                    <!-- 与项目约定一致：保持 javac -Xlint:all 零警告；
+                         同时关掉 -Xlint:options（新版 JDK 对 source level 8 的"已过时"提示，
+                         非代码质量问题，关掉它不影响其余 lint 检查） -->
+                    <compilerArgs>
+                        <arg>-Xlint:all</arg>
+                        <arg>-Xlint:-options</arg>
+                    </compilerArgs>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

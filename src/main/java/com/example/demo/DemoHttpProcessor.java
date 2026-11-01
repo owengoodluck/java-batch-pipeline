@@ -16,8 +16,8 @@ import java.util.Random;
  *
  * <p>这里用随机数模拟三类结果，方便观察到分流效果：
  * <ul>
- *   <li>批次级失败：整批超时 / 5xx —— 抛 BatchFailedException，该批 100 条进错误文件（级别 BATCH）；</li>
- *   <li>记录级失败：单条业务不通过 —— 返回 FAILED 结果，进错误文件（级别 RECORD）；</li>
+ *   <li>批次级失败：整批超时 / 5xx —— 抛 BatchFailedException，该批 100 条进错误通道；</li>
+ *   <li>记录级失败：单条业务不通过 —— 返回 FAILED 结果，进错误通道；</li>
  *   <li>成功：返回服务端附加字段（如服务端流水号、受理状态）。</li>
  * </ul>
  */

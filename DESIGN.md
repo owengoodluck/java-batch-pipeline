@@ -394,8 +394,8 @@ flowchart TB
     B -->|"其他 Exception"| C2["handleBatchFailed('UNKNOWN', msg)"]
     B -->|"正常返回"| D{"results 非空<br/>且 size == batch.size()?"}
     D -- 否 --> C3["handleBatchFailed('BAD_RESPONSE', 条数不符)"]
-    D -- 是 --> E["PartWriter 分流写入:<br/>成功 → success 分片<br/>FAILED → error 分片(RECORD)"]
-    C --> F["整批写入 error 分片(BATCH)<br/>batchFailed++ · 错误码计数"]
+    D -- 是 --> E["PartWriter 分流写入:<br/>成功 → success 分片<br/>FAILED → error 分片"]
+    C --> F["整批写入 error 分片（批次级）<br/>batchFailed++ · 错误码计数"]
     C2 --> F
     C3 --> F
     E --> G["batchOk++<br/>逐条统计: 成功/失败/状态码分布"]
@@ -488,8 +488,8 @@ flowchart TB
     CALL -->|"HTTP 响应"| RES["List&lt;ItemResult&lt;P&gt;&gt;<br/>逐条: 状态码 + 附加内容"]
     RES --> JUDGE{"result.isSuccess()?"}
     JUDGE -- 是 --> OKLINE["成功行<br/>原始记录 + 状态码 + 附加内容"]
-    JUDGE -- 否 --> NGLINE["失败行(RECORD)<br/>原始记录 + 级别 + 错误码 + 消息"]
-    CALL -->|"整批异常"| BFLINE["失败行(BATCH)<br/>原始记录 + 级别 + errorCode + 消息"]
+    JUDGE -- 否 --> NGLINE["失败行<br/>原始记录 + 错误码 + 消息"]
+    CALL -->|"整批异常"| BFLINE["失败行（批次级）<br/>原始记录 + 错误码 + 消息"]
     OKLINE --> PS["part-NNNNNN.success.part"]
     NGLINE --> PE["part-NNNNNN.error.part"]
     BFLINE --> PE
@@ -564,21 +564,23 @@ ORD-000001|CUST-00001|10.90	OK	SID-1-1|ACCEPTED|1793420229046
 
 **错误文件（sample.error）**
 
-```
-{原始记录}\t{级别}\t{错误码}\t{错误信息}
-```
-
-| 级别 | 含义 | 触发条件 |
-|---|---|---|
-| `RECORD` | 记录级失败 | 接口正常返回，该条业务未通过 |
-| `BATCH` | 批次级失败 | 整批调用失败，服务端未收到/未返回结果 |
-
-示例：
+错误通道使用与成功通道**同一个** `RecordFormatter`，只是路由保证它只会收到失败结果。
+Demo 默认实现为**制表符平铺**（顺序：`错误码 → 错误信息 → 原始记录`）：
 
 ```
-ORD-000100|CUST-00100|9.90	RECORD	E1001	余额不足
-ORD-000041|CUST-00041|9.90	BATCH	HTTP_500	批量接口调用失败(HTTP_500)，耗时 127ms
+{错误码}\t{错误信息}\t{原始记录}
 ```
+
+> 失败类别（记录级 / 批次级）不单列“级别”列，而是体现在**错误码**上（例如批次失败用 `HTTP_500`/`TIMEOUT`，记录失败用 `E1001` 等业务码）。
+> 具体格式完全由你提供的 formatter 决定。
+
+示例（Demo 默认）：
+
+```
+E1001\t余额不足\tORD-000100|CUST-00100|9.90
+HTTP_500\t批量接口调用失败(HTTP_500)，耗时 127ms\tORD-000041|CUST-00041|9.90
+```
+
 
 ---
 
@@ -597,8 +599,8 @@ flowchart TB
     L3 --> L3D2["兜底写入失败<br/>磁盘满/权限"]
     L3 --> L3D3["致命错误 OOM"]
     L3 --> L3D4["外部中断 / JVM 关闭"]
-    L1D --> H1["写 error 文件(RECORD)<br/>流程继续"]
-    L2D --> H2["写 error 文件(BATCH)<br/>流程继续"]
+    L1D --> H1["写 error 通道（记录级）<br/>流程继续"]
+    L2D --> H2["写 error 通道（批次级）<br/>流程继续"]
     L3D1 --> H3["全局停止"]
     L3D2 --> H3
     L3D3 --> H3
@@ -796,7 +798,7 @@ public interface RecordFormatter<T, P> {
 |---|---|
 | 线程、并发度、名额 | 记录如何解析 |
 | 批的大小与切分 | 调用什么接口、如何判定成败 |
-| 失败落盘与级别标记 | 输出行长什么样 |
+| 失败落盘（错误通道） | 输出行长什么样 |
 | 合并、原子落地、清理 | 告警/监控接入 |
 | 停止传播与资源释放 | 幂等与重试策略（如需） |
 
@@ -812,7 +814,7 @@ public interface RecordFormatter<T, P> {
 | 2 | 数据守恒（统计层） | 成功 + 记录级失败 + 批次牵连 == 读取总数 | PASS |
 | 3 | 数据守恒（文件层） | 主输出行数 + 错误文件行数 == 输入行数（105 = 73 + 32） | PASS |
 | 4 | 批次级失败落盘 | 注入 25% 批次失败 → 2 批失败，20 条全部进错误文件 | PASS |
-| 5 | 级别区分 | 错误文件中 `RECORD` 与 `BATCH` 行并存可辨 | PASS |
+| 5 | 失败可区分 | 错误文件含失败结果与错误码，由错误码区分记录级 / 批次级 | PASS |
 | 6 | 背压生效 | 消费者耗时大于读取速度时日志出现等待提示 | PASS |
 | 7 | 合并保持行序 | 合并后首列字典序单调不减 | PASS |
 | 8 | 读取异常全局停止 | 第 35 条抛 IOException → 停在 34 条并抛出异常 | PASS |
@@ -867,8 +869,8 @@ public interface RecordFormatter<T, P> {
 | 在途批次 / Inflight | 已提交给消费者但尚未处理完成的批次 |
 | 名额 / Permit | 信号量许可，代表一个允许在途的批次槽位 |
 | 缓冲位 / Buffer | 超出并行线程数的额外槽位，用于预读平滑抖动 |
-| 记录级失败 | 服务端有响应但单条业务未通过，级别 `RECORD` |
-| 批次级失败 | 整批调用未获结果，级别 `BATCH` |
+| 记录级失败 | 单条业务未通过，服务端有明确响应（错误码如 `E1001`） |
+| 批次级失败 | 整批调用未获结果（错误码如 `HTTP_500` / `TIMEOUT`） |
 | 分片 / Part | 单个批次的中间产物文件，合并后删除 |
 
 ### 13.3 常见问题
@@ -900,7 +902,7 @@ v1.0 的分流是硬编码二选一，散落在五处：`PipelineConfig` 四个�
 ### 14.2 通道模型
 
 ```java
-OutputChannel<T, P> = key + target(File) + formatter + createEmpty + isError
+OutputChannel<T, P> = key + target(File) + formatter + createEmpty
 ```
 
 - 声明期（`build()`）确定全部通道，运行期只读；
@@ -937,7 +939,7 @@ OutputChannel<T, P> = key + target(File) + formatter + createEmpty + isError
 强制走错误格式：
 
 ```
-ORD-000095|CUST-00096|45.15	RECORD	UNROUTED:partial_shipped	通道 partial_shipped 未注册（原始结果码 PARTIAL）
+UNROUTED:partial_shipped	通道 partial_shipped 未注册（原始结果码 PARTIAL）	ORD-000095|CUST-00096|45.15
 ```
 
 **② 分片目录的递归清理**
@@ -965,16 +967,16 @@ fallback 有独立计数（`ChannelRouter.unregisteredTotal()`）。两者不要
 | v1.1 写法（已移除） | v1.2 等价写法 |
 |---|---|
 | `LineFormatter`（三方法，每个通道都要实现） | 所有通道 → `RecordFormatter`（单方法，可 lambda；成功读 payload、错误读 code/message） |
-| `channel(key, file, lineFormatter)` | `channel(key, file, recordFormatter)` —— 类型不同，编译期保证普通通道只配成功格式 |
-| `OutputChannel.of(key, file, fmt)` / `OutputChannel.error(file, fmt)` | 从用户 API 移除，改走 builder 唯一的 `channel(...)` 方法 |
-| `OutputChannel.error(...).createEmpty(true)` | `channel("error", file, fmt, true)` |
+| `channel(key, file, lineFormatter)` | `channel(key, file, recordFormatter)` —— 普通通道只收成功、错误通道只收失败，由路由保证；两者共用同一个 `RecordFormatter` 类型 |
+| `OutputChannel.of(key, file, fmt)` / `OutputChannel.error(file, fmt)` | 从用户 API 移除；错误通道改走 builder 的 `errorChannel(...)`，其余走 `channel(...)` |
+| `OutputChannel.error(...).createEmpty(true)` | `errorChannel(file, fmt, true)` |
 | `channelOf` 里 `if (!result.isSuccess()) return null;` | 删掉——`channelOf` 只对成功记录调用，失败一律自动进错误通道 |
 | `ItemResult.getStatus()` / `OutcomeStatus` | 删除——用 `isSuccess()`，内部是布尔位 |
 | `RecordReader` 方法 `throws Exception` | 收窄为 `throws IOException` |
 | `new FileBatchPipeline<>(config).run()`（void） | `run()` 返回 `BatchResult` 快照；或一行式 `BatchPipeline.run(config)` |
 
-输出格式统一为单个 `RecordFormatter` 后，`channel()` 成为唯一声明方法（成功/错误/业务通道都用它）。
-构建期不再做角色校验与 fail-fast（错误通道缺失会在首次失败时在运行期抛出清晰异常），
+输出格式统一为单个 `RecordFormatter` 后，错误通道用专用 `errorChannel(...)` 声明（兜底安全网，构建期校验必须存在），成功与业务通道用 `channel(...)`。
+构建期仅对**错误通道这一个**做存在性校验（缺失直接报错，避免首次失败才崩溃）；其余通道不做校验，
 把"信任用户配置、保持 API 简洁"放在"编译期防呆"之前。
 
 **v1.1**：v1.0 的二通道写法（`successFile/errorFile/successFormatter/errorFormatter/createEmptyOutput`）
@@ -983,7 +985,7 @@ fallback 有独立计数（`ChannelRouter.unregisteredTotal()`）。两者不要
 | v1.0 写法 | 等价写法 |
 |---|---|
 | `successFile(f)` + `successFormatter(fmt)` | `channel("success", f, fmt)`（保留 key） |
-| `errorFile(f)` + `errorFormatter(fmt)` | `channel("error", f, fmt)` |
+| `errorFile(f)` + `errorFormatter(fmt)` | `errorChannel(f, fmt)` |
 | `createEmptyOutput(true)`（全局） | 对需要的通道用带 `createEmpty` 参数的重载 |
 
 ### 14.7 明确不支持的两种形态

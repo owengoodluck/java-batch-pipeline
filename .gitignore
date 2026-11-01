@@ -1,5 +1,5 @@
-# 编译产物
-out/
+# Maven 构建产物
+target/
 *.class
 
 # IDE

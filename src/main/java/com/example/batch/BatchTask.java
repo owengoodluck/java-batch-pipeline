@@ -10,7 +10,7 @@ import java.util.concurrent.Semaphore;
  *
  * <p>失败策略（按设计定稿）：
  * <ul>
- *   <li>批次调用失败（BatchFailedException / 其他异常）→ 整批写入错误文件，级别 BATCH，后续批次继续；</li>
+ *   <li>批次调用失败（BatchFailedException / 其他异常）→ 整批写入错误通道，后续批次继续；</li>
  *   <li>写分片失败 = 兜底失效 → 触发全局停止（不能静默丢数据）；</li>
  *   <li>致命错误（Error，如 OOM）→ 触发全局停止。</li>
  * </ul>

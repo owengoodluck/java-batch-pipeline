@@ -60,10 +60,9 @@ public class DemoMain {
                 .partsDir(partsDir)
                 // 没实现 RoutingProcessor：成功记录自动进 success 通道，失败记录进 error 通道。
                 // createEmpty(true)：无记录时也生成空文件，保持下游"固定文件集"的读法。
-                // success / error 只是两个普通通道 key，都用同一个 channel(...) 声明。
                 .channel("success", new File(outputDir, "sample.success"),
                         DemoLineFormatter.SUCCESS_TSV, true)
-                .channel("error", new File(outputDir, "sample.error"),
+                .errorChannel(new File(outputDir, "sample.error"),
                         DemoLineFormatter.ERROR_TSV, true)
                 .build();
 

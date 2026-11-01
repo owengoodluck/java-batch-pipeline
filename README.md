@@ -4,7 +4,7 @@
 
 面向**"有终点、有大批量数据"**的批处理场景：单线程读文件 → 每 100 条打包成一批 → 多线程并发调用批量 HTTP 接口 → 成功记录合并成主输出文件、失败记录合并成错误文件。
 
-零第三方依赖，**纯 JDK 即可编译运行**（代码按 Java 8 兼容语法编写）。
+零第三方依赖，**纯 JDK 即可编译运行**；使用 **Maven** 构建，目标字节码为 Java 8（见 `pom.xml`，无需手写 javac）。
 
 ---
 
@@ -12,16 +12,18 @@
 
 ```bash
 cd java-batch-pipeline
-chmod +x run.sh
+mvn compile          # 用 Maven 编译到 target/classes（run.sh 内部也是这一步）
+# 或一键编译并跑完两个 Demo：
 ./run.sh
 ```
 
-脚本会编译源码，并以两种方式各跑一次 Demo：
+编译后可直接运行（产物在 `target/classes`）：
 
 | 运行方式 | 说明 |
 |---|---|
-| `java -cp out/classes com.example.demo.DemoMain` | 专用 `RecordReader` 实现读取 |
-| `java -cp out/classes com.example.demo.DemoMain demo-run adapter` | 用适配器把 `read()` 形态的读取工具接进来 |
+| `java -cp target/classes com.example.demo.DemoMain` | 专用 `RecordReader` 实现读取 |
+| `java -cp target/classes com.example.demo.DemoMain demo-run adapter` | 用适配器把 `read()` 形态的读取工具接进来 |
+| `java -cp target/classes com.example.demo.DemoOrderMain order-demo 1000` | 多通道：1000 条订单按状态分流到 4 个业务文件 + 1 个错误文件 |
 
 产物位于 `demo-run/`：
 
@@ -39,7 +41,7 @@ demo-run/
 ## 二、目录结构
 
 ```
-src/com/example/batch/            ← 与业务无关的通用内核（不要改）
+src/main/java/com/example/batch/            ← 通用内核（Maven 标准布局，不要改）
 ├── RecordReader.java           读取接口（SPI，抛 IOException）
 ├── RecordReaders.java          Iterator / read() 形态的适配器
 ├── BatchProcessor.java         批处理接口（SPI，通常是调 HTTP）
@@ -59,14 +61,14 @@ src/com/example/batch/            ← 与业务无关的通用内核（不要改
 ├── FileBatchPipeline.java      内核编排（生产者/背压/合并/停机）
 └── PipelineLog.java            极简日志门面（可换成 SLF4J）
 
-src/com/example/demo/            ← 业务方要写的部分（替换成你的真实实现）
+src/main/java/com/example/demo/            ← 示例业务实现（替换成你的真实实现）
 ├── DemoLineReader.java         RecordReader 的一种实现（文本文件按行读）
 ├── DemoHttpProcessor.java      BatchProcessor 的一种实现（模拟批量 HTTP）
 ├── DemoLineFormatter.java      RecordFormatter 实现（成功/错误两套行格式）
 ├── DemoMain.java               装配 + 运行（双输出：成功 / 错误）
 ├── DemoOrderStatus.java        订单状态枚举（其中一个状态故意不注册通道）
 ├── DemoOrderProcessor.java     RoutingProcessor 实现：按查询到的状态分流
-└── DemoOrderMain.java          装配 + 运行（多通道：4 个业务文件 + 1 个错误文件）
+└── DemoOrderMain.java          装配 + 运行（多通道：4 个业务文件 + 1 个错误通道）
 ```
 
 ---
@@ -116,7 +118,7 @@ PipelineConfig.<String, String>builder()
     .channel("shipped",   new File(dir, "order.shipped"),   fmt)
     .channel("completed", new File(dir, "order.completed"), fmt)
     .channel("cancelled", new File(dir, "order.cancelled"), fmt)
-    .channel("error", new File(dir, "order.error"), errFmt)   // 错误通道（key 固定 error）
+    .errorChannel(new File(dir, "order.error"), errFmt)          // 错误通道（兜底，key 固定 error）
     .build();
 ```
 
@@ -150,7 +152,7 @@ parts/
 
 按通道分子目录，而不是 `part-000001.paid.part`：合并时扫一个目录就够，通道 key 也不必参与文件名转义。
 
-**某个通道这次没有记录**：不会有分片文件，合并阶段自然就知道——不需要额外统计。若下游必须拿到固定文件，用 `channel(key, file, fmt, true)` 单独打开（`channel("error", ..., true)` / `channel("success", ..., true)` 建议打开，便于告警侧统一处理）。
+**某个通道这次没有记录**：不会有分片文件，合并阶段自然就知道——不需要额外统计。若下游必须拿到固定文件，用 `channel(key, file, fmt, true)` 单独打开（`errorChannel(file, fmt, true)` / `channel("success", ..., true)` 建议打开，便于告警侧统一处理）。
 
 ---
 
@@ -199,7 +201,7 @@ public class MyProcessor implements BatchProcessor<MyRecord, MyPayload> {
 RecordFormatter<MyRecord, MyPayload> okFmt =
         (r, res) -> r.raw() + "\t" + res.getCode() + "\t" + res.getPayload();
 
-// 错误通道（key="error"）：只会收到失败结果，读 result.getCode() / result.getMessage()
+// 错误通道（用 .errorChannel(...) 声明，key 固定 "error"）：只会收到失败结果，读 result.getCode() / result.getMessage()
 RecordFormatter<MyRecord, MyPayload> errFmt =
         (r, res) -> res.getCode() + "\t" + res.getMessage() + "\t" + r.raw();
 ```
@@ -213,7 +215,7 @@ BatchResult result = BatchPipeline.run(PipelineConfig.<MyRecord, MyPayload>build
         // 分片目录默认落系统临时区；想观察 parts/ 结构时再用 .partsDir(dir) 显式指定
         // 输出是通道表：每个通道 = key + 文件 + 同一个 RecordFormatter。
         .channel("success", successFile, okFmt)        // 成功记录落这（未实现 RoutingProcessor 时接收全部成功）
-        .channel("error",   errorFile,   errFmt)       // 错误与未注册路由落这（key 固定 error）
+        .errorChannel(errorFile,   errFmt)             // 错误与未注册路由落这（key 固定 error）
         // .channel("review", reviewFile, okFmt)        // 需要分流时再加，配合 RoutingProcessor
         .build());
 System.out.println(result);   // 读取数、成功/失败、通道分布、耗时
@@ -235,7 +237,7 @@ System.out.println(result);   // 读取数、成功/失败、通道分布、耗�
 | `charset` | UTF-8 | 读写编码 |
 | `deletePartsOnSuccess` | true | 合并成功后清理分片目录 |
 
-输出侧没有全局的"空文件开关"——它是**每个通道自己的属性**：`channel(key, file, fmt, true)`。默认不生成，需要固定文件集的下游对个别通道打开（如 `channel("error", file, fmt, true)`）。
+输出侧没有全局的"空文件开关"——它是**每个通道自己的属性**：`channel(key, file, fmt, true)`。默认不生成，需要固定文件集的下游对个别通道打开（如 `errorChannel(file, fmt, true)`）。
 
 **调参建议**：批处理（写库/调接口）通常远慢于"读 100 行文本"，所以 `B = 1` 基本就能消除消费者空等；`B` 再往上加只是白占内存。`consumerThreads` 则取决于接口服务端的并发承受能力。
 
